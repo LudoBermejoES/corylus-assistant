@@ -54,66 +54,73 @@ impl EngineConfig {
     }
 }
 
+/// Sync-only shared state (config + current state machine state).
 pub(crate) struct Inner {
     pub config: EngineConfig,
     pub state: AssistantState,
-    pub backend: OllamaBackend,
 }
 
 /// The assistant engine. Cheap to clone (Arc-backed).
+///
+/// The backend uses a tokio Mutex so it can be locked across `.await` without
+/// violating the `Send` bound on `tauri::async_runtime::spawn`.
 #[derive(Clone)]
-pub struct AssistantEngine(Arc<Mutex<Inner>>);
+pub struct AssistantEngine {
+    inner: Arc<Mutex<Inner>>,
+    backend: Arc<tokio::sync::Mutex<OllamaBackend>>,
+}
 
 impl AssistantEngine {
     pub fn new(config: EngineConfig) -> Self {
         let backend = OllamaBackend::new(config.clone());
-        Self(Arc::new(Mutex::new(Inner {
-            state: AssistantState::NotInstalled,
-            backend,
-            config,
-        })))
+        Self {
+            inner: Arc::new(Mutex::new(Inner {
+                state: AssistantState::NotInstalled,
+                config,
+            })),
+            backend: Arc::new(tokio::sync::Mutex::new(backend)),
+        }
     }
 
     /// Update data dir. Called from app setup once the resolved app-data dir is known.
     pub fn set_data_dir(&self, data_dir: PathBuf) {
-        let mut g = self.0.lock().unwrap();
+        let mut g = self.inner.lock().unwrap();
         g.config.data_dir = data_dir.clone();
-        g.backend.config.data_dir = data_dir;
-        // Probe without blocking — just sets the initial state
-        let s = g.backend.probe();
-        g.state = s;
-        // If a version sentinel exists, the model was ready last session — stay NotInstalled
-        // until the app actually re-confirms readiness (avoids false Ready on cold start).
+        // Probe the backend synchronously; try_lock is safe here since no async
+        // task holds the backend lock at startup.
+        if let Ok(mut b) = self.backend.try_lock() {
+            b.config.data_dir = data_dir;
+            let s = b.probe();
+            g.state = s;
+        }
         if state::is_ready(&g.config) {
-            // Model was present last time; optimistically mark Ready (server still needs probing)
-            // The first actual chat/embed will re-verify server liveness.
             g.state = AssistantState::Ready;
         }
     }
 
     pub fn state(&self) -> AssistantState {
-        self.0.lock().unwrap().state.clone()
+        self.inner.lock().unwrap().state.clone()
     }
 
     pub fn data_dir(&self) -> PathBuf {
-        self.0.lock().unwrap().config.data_dir.clone()
+        self.inner.lock().unwrap().config.data_dir.clone()
     }
 
     pub fn config(&self) -> EngineConfig {
-        self.0.lock().unwrap().config.clone()
+        self.inner.lock().unwrap().config.clone()
     }
 
     /// Begin provisioning (install Ollama + pull model). Consent must be given before calling.
     pub async fn provision(
         &self,
-        on_progress: impl Fn(AssistantState) + Send + 'static,
+        on_progress: impl Fn(AssistantState) + Send + Sync + 'static,
     ) -> Result<()> {
-        provision::run(self.0.clone(), on_progress).await
+        provision::run(self.inner.clone(), self.backend.clone(), on_progress).await
     }
 
     /// Detect available system RAM (best-effort).
     pub fn detect_ram_bytes(&self) -> Option<u64> {
-        self.0.lock().unwrap().backend.detect_ram_bytes()
+        self.backend.try_lock().ok().as_mut().map(|b| b.detect_ram_bytes()).flatten()
     }
 
     /// Return the RAM-aware default model tag and its approximate size/RAM.
@@ -129,13 +136,13 @@ impl AssistantEngine {
 
     /// Uninstall: remove the version sentinel (model files stay in Ollama's store).
     pub fn uninstall(&self) -> Result<()> {
-        let g = self.0.lock().unwrap();
+        let g = self.inner.lock().unwrap();
         let ver = state::version_path(&g.config);
         if ver.exists() {
             std::fs::remove_file(&ver)?;
         }
         drop(g);
-        self.0.lock().unwrap().state = AssistantState::NotInstalled;
+        self.inner.lock().unwrap().state = AssistantState::NotInstalled;
         Ok(())
     }
 }

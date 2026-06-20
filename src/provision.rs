@@ -9,14 +9,19 @@ use tracing::info;
 use crate::{
     Inner, AssistantState, Result,
     backend::AssistantBackend,
+    ollama::OllamaBackend,
     state::{VersionFile, SCHEMA_VERSION, version_path},
 };
 
 /// Run the full provision sequence: Ollama install (if needed + consented) → model pull.
 /// `on_progress` receives every status transition.
+///
+/// `backend` is a separate `tokio::sync::Mutex` so we can `.await` inside it
+/// without violating the `Send` bound — `std::sync::MutexGuard` is not `Send`.
 pub async fn run(
     inner: Arc<Mutex<Inner>>,
-    on_progress: impl Fn(AssistantState) + Send + 'static,
+    backend: Arc<tokio::sync::Mutex<OllamaBackend>>,
+    on_progress: impl Fn(AssistantState) + Send + Sync + 'static,
 ) -> Result<()> {
     let config = {
         let g = inner.lock().unwrap();
@@ -27,11 +32,16 @@ pub async fn run(
     set_state(&inner, AssistantState::NotInstalled);
     on_progress(AssistantState::NotInstalled);
 
+    // Wrap on_progress in Arc so both the ensure_ready closure and the post-await
+    // call share the same callback without moving it.
+    let on_progress = std::sync::Arc::new(on_progress);
+    let on_progress2 = on_progress.clone();
+    let inner2 = inner.clone();
     {
-        let mut g = inner.lock().unwrap();
-        g.backend.ensure_ready(|s| {
-            // Mirror backend status into our state and forward to caller
-            let _ = s.clone();
+        let mut b = backend.lock().await;
+        b.ensure_ready(move |s| {
+            inner2.lock().unwrap().state = s.clone();
+            on_progress2(s);
         }).await?;
     }
 
