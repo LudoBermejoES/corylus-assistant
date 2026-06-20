@@ -418,6 +418,43 @@ impl AssistantBackend for OllamaBackend {
         self.state = AssistantState::Ready;
         on_status(AssistantState::Ready);
         info!("[assistant] model {} ready", model_id);
+
+        // Also pull the embedding model if it differs from the chat model.
+        let embed_id = self.config.embedding_model.clone();
+        if embed_id != model_id {
+            if self.model_present(&embed_id).await {
+                info!("[assistant] embedding model {} already present", embed_id);
+            } else {
+                info!("[assistant] pulling embedding model {}", embed_id);
+                on_status(AssistantState::Downloading { downloaded: 0, total: None });
+                let resp = self
+                    .client
+                    .post(format!("{}/api/pull", OLLAMA_BASE))
+                    .json(&serde_json::json!({ "name": embed_id, "stream": true }))
+                    .send()
+                    .await
+                    .map_err(AssistantError::Http)?;
+                let mut stream = resp.bytes_stream();
+                while let Some(chunk) = stream.next().await {
+                    let chunk = chunk.map_err(AssistantError::Http)?;
+                    for line in chunk.split(|&b| b == b'\n') {
+                        if line.is_empty() { continue; }
+                        if let Ok(val) = serde_json::from_slice::<serde_json::Value>(line) {
+                            let completed = val.get("completed").and_then(|v| v.as_u64());
+                            let total = val.get("total").and_then(|v| v.as_u64());
+                            if let Some(downloaded) = completed {
+                                on_status(AssistantState::Downloading { downloaded, total });
+                            }
+                            if val.get("status").and_then(|v| v.as_str()) == Some("success") {
+                                break;
+                            }
+                        }
+                    }
+                }
+                info!("[assistant] embedding model {} ready", embed_id);
+            }
+        }
+
         Ok(())
     }
 

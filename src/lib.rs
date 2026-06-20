@@ -50,7 +50,7 @@ impl EngineConfig {
         Self {
             data_dir,
             model_id: tier.default_model().into(),
-            embedding_model: tier.default_model().into(),
+            embedding_model: "nomic-embed-text".into(),
             ollama_endpoint: "http://127.0.0.1:11434".into(),
             context_window: 4096,
         }
