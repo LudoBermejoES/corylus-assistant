@@ -5,13 +5,15 @@
 //!   - Download-on-demand: Ollama + a Qwen3 model are fetched at runtime, never bundled.
 //!   - Backend abstraction: `AssistantBackend` trait; Phase 1 = `OllamaBackend`.
 //!   - State machine: not_installed → needs_install/server_down → downloading → ready | error.
-//!   - RAG grounding: sqlite-vec index over manuscript + story-bible (stubs for Phase 2).
+//!   - RAG grounding: sqlite-vec index over manuscript + story-bible.
 
 mod error;
 mod state;
 mod backend;
 mod ollama;
 mod provision;
+pub mod rag;
+pub mod index;
 
 #[cfg(test)]
 mod tests;
@@ -20,6 +22,7 @@ pub use error::AssistantError;
 pub use state::AssistantState;
 pub use backend::{AssistantBackend, ChatMessage, ChatToken, RamTier, RetrievedChunk, build_system_prompt};
 pub use ollama::OllamaBackend;
+pub use index::{VectorIndex, RetrievedRow};
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -89,9 +92,14 @@ impl AssistantEngine {
         // Probe the backend synchronously; try_lock is safe here since no async
         // task holds the backend lock at startup.
         if let Ok(mut b) = self.backend.try_lock() {
-            b.config.data_dir = data_dir;
+            b.config.data_dir = data_dir.clone();
             let s = b.probe();
             g.state = s;
+            // Restore engine_managed_install from the persisted version sentinel so
+            // that subsequent `ollama serve` invocations keep OLLAMA_MODELS set correctly.
+            if let Ok(ver) = state::read_version_file(&g.config) {
+                b.engine_managed_install = ver.ollama_managed;
+            }
         }
         if state::is_ready(&g.config) {
             g.state = AssistantState::Ready;
@@ -144,6 +152,59 @@ impl AssistantEngine {
         drop(g);
         self.inner.lock().unwrap().state = AssistantState::NotInstalled;
         Ok(())
+    }
+
+    /// Index a set of project documents for RAG retrieval.
+    ///
+    /// `documents` is a list of `(relative_path, plain_text_content)` pairs.
+    /// Pass `full_reindex = true` to wipe the existing index first.
+    /// Returns `Err(EmbeddingModelMismatch)` if the configured embedding model
+    /// changed since the index was last built — caller must set `full_reindex = true`.
+    pub async fn index_project(
+        &self,
+        documents: Vec<(String, String)>,
+        full_reindex: bool,
+        on_progress: impl Fn(usize, usize) + Send + 'static,
+    ) -> Result<()> {
+        let config = self.config();
+        let mut idx = index::VectorIndex::open(&config)?;
+
+        if !full_reindex {
+            idx.check_model_compatibility(&config)?;
+        }
+
+        // The embed closure captures a clone of the backend Arc so it can be called
+        // from within the async indexing loop without holding any outer lock.
+        let backend = self.backend.clone();
+
+        struct BackendEmbedder(Arc<tokio::sync::Mutex<OllamaBackend>>);
+        impl rag::AsyncEmbedFn for BackendEmbedder {
+            async fn embed(&self, text: &str) -> Result<Vec<f32>> {
+                let b = self.0.lock().await;
+                backend::AssistantBackend::embed(&*b, text).await
+            }
+        }
+
+        let embedder = BackendEmbedder(backend);
+
+        if full_reindex {
+            idx.full_reindex(documents, &config, &embedder, on_progress).await
+        } else {
+            idx.incremental_update(documents, &config, &embedder, on_progress).await
+        }
+    }
+
+    /// Retrieve the top-K most relevant chunks for `query`, using the RAG index.
+    /// Returns an empty vec when the index has no content or the engine isn't ready.
+    pub async fn retrieve(&self, query: &str, top_k: usize) -> Result<Vec<RetrievedRow>> {
+        let config = self.config();
+        let idx = index::VectorIndex::open(&config)?;
+        if idx.chunk_count()? == 0 {
+            return Ok(vec![]);
+        }
+        // Embed the query with the same model used to build the index
+        let query_vec = self.backend.lock().await.embed(query).await?;
+        idx.top_k(&query_vec, top_k)
     }
 }
 

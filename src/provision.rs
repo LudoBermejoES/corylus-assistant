@@ -45,11 +45,13 @@ pub async fn run(
         }).await?;
     }
 
-    // Write version sentinel so we remember the model is ready across restarts
+    // Write version sentinel so we remember the model is ready across restarts.
+    // Capture whether we managed the Ollama install so we know to set OLLAMA_MODELS on next start.
+    let ollama_managed = backend.lock().await.engine_managed_install;
     let ver = VersionFile {
         model_id: config.model_id.clone(),
         schema_version: SCHEMA_VERSION,
-        ollama_managed: false,
+        ollama_managed,
     };
     let ver_path = version_path(&config);
     std::fs::write(&ver_path, serde_json::to_string_pretty(&ver)?)?;

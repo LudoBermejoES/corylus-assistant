@@ -20,6 +20,9 @@ pub struct OllamaBackend {
     pub config: EngineConfig,
     pub state: AssistantState,
     client: reqwest::Client,
+    /// True when this engine performed the Ollama install itself, meaning we own the model store
+    /// and should set OLLAMA_MODELS to keep files under our data dir.
+    pub(crate) engine_managed_install: bool,
 }
 
 impl OllamaBackend {
@@ -32,6 +35,7 @@ impl OllamaBackend {
             state: AssistantState::NotInstalled,
             config,
             client,
+            engine_managed_install: false,
         }
     }
 
@@ -52,11 +56,18 @@ impl OllamaBackend {
         // Try starting ollama serve
         if self.ollama_binary_present() {
             info!("[assistant] starting ollama serve");
-            let _ = tokio::process::Command::new("ollama")
-                .arg("serve")
+            let mut cmd = tokio::process::Command::new("ollama");
+            cmd.arg("serve")
                 .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .spawn();
+                .stderr(std::process::Stdio::null());
+            // If we installed Ollama ourselves, point its model store under our data dir
+            // so model files are self-contained. A pre-existing install keeps its own store.
+            if self.engine_managed_install {
+                let models_dir = self.config.data_dir.join("models");
+                cmd.env("OLLAMA_MODELS", &models_dir);
+                info!("[assistant] OLLAMA_MODELS={}", models_dir.display());
+            }
+            let _ = cmd.spawn();
             // Wait up to 8 seconds for server to come up
             for _ in 0..16 {
                 tokio::time::sleep(Duration::from_millis(500)).await;
@@ -123,6 +134,7 @@ impl AssistantBackend for OllamaBackend {
         if !self.ollama_binary_present() {
             on_status(AssistantState::NeedsInstall);
             self.install_ollama().await?;
+            self.engine_managed_install = true;
         }
 
         // Step 2: start the server
@@ -160,7 +172,6 @@ impl AssistantBackend for OllamaBackend {
 
         use futures_util::StreamExt;
         let mut stream = resp.bytes_stream();
-        let mut total_downloaded: u64 = 0;
 
         while let Some(chunk) = stream.next().await {
             let chunk = chunk.map_err(AssistantError::Http)?;
@@ -172,12 +183,8 @@ impl AssistantBackend for OllamaBackend {
                 if let Ok(val) = serde_json::from_slice::<serde_json::Value>(line) {
                     let completed = val.get("completed").and_then(|v| v.as_u64());
                     let total = val.get("total").and_then(|v| v.as_u64());
-                    if let Some(c) = completed {
-                        total_downloaded = c;
-                        on_status(AssistantState::Downloading {
-                            downloaded: total_downloaded,
-                            total,
-                        });
+                    if let Some(downloaded) = completed {
+                        on_status(AssistantState::Downloading { downloaded, total });
                     }
                     let status = val.get("status").and_then(|v| v.as_str()).unwrap_or("");
                     if status == "success" {
@@ -364,6 +371,12 @@ impl OllamaBackend {
             )));
         }
         Ok(())
+    }
+}
+
+impl crate::rag::AsyncEmbedFn for OllamaBackend {
+    async fn embed(&self, text: &str) -> crate::Result<Vec<f32>> {
+        AssistantBackend::embed(self, text).await
     }
 }
 

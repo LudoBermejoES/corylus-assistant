@@ -47,6 +47,12 @@ pub struct VersionFile {
 
 pub const SCHEMA_VERSION: u32 = 1;
 
+/// Read the version sentinel file, returning an error if absent or malformed.
+pub fn read_version_file(config: &EngineConfig) -> crate::Result<VersionFile> {
+    let data = std::fs::read_to_string(version_path(config))?;
+    Ok(serde_json::from_str(&data)?)
+}
+
 /// Returns true when Ollama has already been installed/managed by this engine
 /// (a version file exists recording ollama_managed=true) OR the user has their
 /// own Ollama and the configured model is present.
