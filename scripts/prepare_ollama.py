@@ -130,13 +130,15 @@ def repack_macos(src: Path, out_zip: Path) -> None:
     We deduplicate by content: for each unique inode/content hash we keep only
     the shortest name (the unversioned one, e.g. libggml-base.dylib).
 
-    Skipped entirely: llama-server, llama-quantize (server binaries not needed).
+    Skipped: llama-quantize (not needed at runtime).
+    Included: ollama, llama-server (required to run models), *.dylib, mlx_metal_v*/
 
     Output zip layout:
         ollama
+        llama-server
         *.dylib              (unversioned names only)
-        mlx_metal_v3/*.dylib (Apple Silicon Metal GPU — kept for M-series Macs)
-        mlx_metal_v4/*.dylib
+        mlx_metal_v3/        (Apple Silicon Metal GPU — kept for M-series Macs)
+        mlx_metal_v4/
     """
     print("  Repacking macOS …")
     with tarfile.open(src, "r:gz") as tf:
@@ -182,9 +184,12 @@ def repack_macos(src: Path, out_zip: Path) -> None:
         # Collect candidates: (name, member)
         candidates: list[tuple[str, tarfile.TarInfo]] = []
         for name, m in all_files.items():
-            if name == "ollama":
+            if name in ("ollama", "llama-server"):
                 candidates.append((name, m))
             elif name.endswith(".dylib") and name in dylib_canonical:
+                candidates.append((name, m))
+            elif name.startswith(("mlx_metal_v3/", "mlx_metal_v4/")):
+                # Metal GPU shader libs for Apple Silicon
                 candidates.append((name, m))
 
         with zipfile.ZipFile(out_zip, "w", compression=zipfile.ZIP_DEFLATED) as zf:
@@ -278,43 +283,75 @@ def _decompress_zstd(src: Path) -> bytes:
 
 def repack_windows(src: Path, out_zip: Path) -> None:
     """
-    ollama-windows-amd64.zip contains files in multiple subdirectories
-    (cuda_v12/, rocm/, etc.) plus a flat root level. We:
-      - Keep only ollama.exe and *.dll from the flat root (no subdirs)
-      - Skip GPU/ROCm subdirectories entirely
-      - Deduplicate by basename (first occurrence wins)
-      - Skip known GPU DLLs (ggml-cuda, ggml-vulkan, vulkan-1)
+    ollama-windows-amd64.zip layout:
+        ollama.exe                          ← main CLI/server (root-level)
+        lib/ollama/llama-server.exe         ← required for inference
+        lib/ollama/llama-quantize.exe       ← not needed at runtime, skip
+        lib/ollama/libllama*.dll            ← inference libs
+        lib/ollama/ggml*.dll                ← CPU GGML backends
+        lib/ollama/libc++.dll / libomp.dll  ← runtime deps
+        lib/ollama/cuda_v12/                ← GPU, excluded
+        lib/ollama/cuda_v13/                ← GPU, excluded
+        lib/ollama/vulkan/                  ← GPU, excluded
 
-    Output zip: all files flat at root, no subdirectories.
+    We keep (all flattened to root so ollama.exe and llama-server.exe sit together):
+      - ollama.exe
+      - llama-server.exe  (from lib/ollama/ — required for inference)
+      - CPU DLLs from lib/ollama/ (ggml-base, ggml-cpu-*, libllama*, libc++, libomp, etc.)
+
+    GPU subdirs (cuda_v12/, cuda_v13/, vulkan/) are excluded to keep size down.
+    The zip is fully flat (no subdirectories) so extraction into {data_dir}/bin/
+    places every file alongside ollama.exe as Ollama expects.
     """
     print("  Repacking Windows …")
-    with zipfile.ZipFile(src, "r") as src_zf:
-        # Collect only root-level entries (no "/" in name after normalisation)
-        root_entries = []
-        for info in src_zf.infolist():
-            if info.is_dir():
-                continue
-            name = info.filename.replace("\\", "/")
-            if "/" in name:
-                continue  # skip subdirectory entries (cuda_v12/, rocm/, …)
-            root_entries.append(info)
 
-        seen: set[str] = set()
+    # DLL name prefixes that are GPU-only and should be excluded
+    GPU_DLL_PREFIXES_WIN = (
+        "ggml-cuda", "ggml-vulkan", "vulkan-",
+        "cublas", "cublaslt", "cudart",
+        "rocblas", "hipblas",
+    )
+
+    seen: set[str] = set()
+
+    with zipfile.ZipFile(src, "r") as src_zf:
         with zipfile.ZipFile(out_zip, "w", compression=zipfile.ZIP_DEFLATED) as zf:
-            for info in root_entries:
-                basename = info.filename
-                if basename in seen:
+            for info in src_zf.infolist():
+                if info.is_dir():
                     continue
-                if basename != "ollama.exe" and not basename.endswith(".dll"):
+                name = info.filename.replace("\\", "/")
+
+                # Root-level ollama.exe
+                if name == "ollama.exe":
+                    if name not in seen:
+                        seen.add(name)
+                        data = src_zf.read(info)
+                        new_info = zipfile.ZipInfo(name)
+                        new_info.external_attr = info.external_attr
+                        new_info.compress_type = zipfile.ZIP_DEFLATED
+                        zf.writestr(new_info, data)
                     continue
-                if _is_gpu_dll(basename):
-                    continue
-                seen.add(basename)
-                data = src_zf.read(info)
-                new_info = zipfile.ZipInfo(basename)
-                new_info.external_attr = info.external_attr
-                new_info.compress_type = zipfile.ZIP_DEFLATED
-                zf.writestr(new_info, data)
+
+                # lib/ollama/ entries — flatten to root
+                if name.startswith("lib/ollama/"):
+                    # Skip GPU sub-directories entirely
+                    if any(name.startswith(f"lib/ollama/{p}") for p in ("cuda_v", "rocm", "oneapi", "vulkan/")):
+                        continue
+                    basename = name.rsplit("/", 1)[-1]
+                    # Skip GPU DLLs by name
+                    if any(basename.lower().startswith(p) for p in GPU_DLL_PREFIXES_WIN):
+                        continue
+                    # Skip llama-quantize.exe (not needed at runtime)
+                    if basename == "llama-quantize.exe":
+                        continue
+                    if basename not in seen:
+                        seen.add(basename)
+                        data = src_zf.read(info)
+                        # Write as flat root entry (basename only, no lib/ollama/ prefix)
+                        new_info = zipfile.ZipInfo(basename)
+                        new_info.external_attr = info.external_attr
+                        new_info.compress_type = zipfile.ZIP_DEFLATED
+                        zf.writestr(new_info, data)
     _report_zip(out_zip)
 
 

@@ -17,8 +17,8 @@
 //! relocation — they own that install).
 
 use std::path::{Path, PathBuf};
-use std::sync::mpsc::Sender;
 use std::time::Duration;
+use tokio::sync::mpsc::UnboundedSender as Sender;
 use tracing::{info, warn};
 
 use futures_util::StreamExt;
@@ -32,22 +32,25 @@ use crate::{
 
 // ── Asset constants ────────────────────────────────────────────────────────────
 
-const OLLAMA_VERSION: &str = "v0.30.10";
+const OLLAMA_VERSION: &str = "v0.30.10-1";
 
 // SHA-256 of the repacked zips produced by scripts/prepare_ollama.py.
 // Update these (and OLLAMA_VERSION above) whenever the script is re-run.
 const OLLAMA_SHA256_MACOS_UNIVERSAL: &str =
-    "ea8520f6d74c96629aeeee95454efa1fb9eb6b61085760ca7aac2a1b8aaa27d9";
+    "11f889a1ab3c4b3f91561a3b54b2438a30029c271aa07da22e6f38e511fe4781";
 const OLLAMA_SHA256_LINUX_X86_64: &str =
     "d6109b0be28b4b285ca49b435c82941f6d04cdfaadc08fa512e40a03668bb10a";
 const OLLAMA_SHA256_LINUX_AARCH64: &str =
     "8602ed350edf273d07e357aa60c328d5b6d4a79111bb1949987aa9f2bf738489";
 const OLLAMA_SHA256_WINDOWS_X86_64: &str =
-    "abd8c08153d02d3dbe31a32c4c014397487462e4d1460f3322d05fb8c4644613";
+    "a037da7ff3f49f7dfc2431a42686b3027a75ecb3e6684276e6b9f15938fb37cd";
 
 // Base URL for the vendored zips on the rust-assistant GitHub Release.
 const ASSET_BASE_URL: &str =
     "https://github.com/LudoBermejoES/corylus-assistant/releases/download";
+// GitHub Release tag for the asset zips (may differ from OLLAMA_VERSION when
+// we repack with fixes without bumping the upstream Ollama version).
+const ASSET_RELEASE_TAG: &str = "v0.30.10";
 
 // ── Misc constants ─────────────────────────────────────────────────────────────
 
@@ -84,22 +87,28 @@ impl OllamaBackend {
     // ── Server health ──────────────────────────────────────────────────────────
 
     async fn server_alive(&self) -> bool {
-        self.client
+        let alive = self.client
             .get(format!("{}/api/tags", OLLAMA_BASE))
             .timeout(Duration::from_secs(HEALTH_TIMEOUT_SECS))
             .send()
             .await
             .map(|r| r.status().is_success())
-            .unwrap_or(false)
+            .unwrap_or(false);
+        info!("[assistant] server_alive: {}", alive);
+        alive
     }
 
     async fn ensure_server_running(&mut self) -> Result<()> {
+        info!("[assistant] ensure_server_running: checking if server is alive");
         if self.server_alive().await {
+            info!("[assistant] ensure_server_running: server already alive");
             return Ok(());
         }
+        info!("[assistant] ensure_server_running: server not alive, engine_managed_install={}", self.engine_managed_install);
 
         let bin = self.ollama_binary_path();
         let Some(bin_path) = bin else {
+            warn!("[assistant] ensure_server_running: no ollama binary found");
             return Err(AssistantError::OllamaNotInstalled);
         };
 
@@ -118,17 +127,23 @@ impl OllamaBackend {
             info!("[assistant] OLLAMA_MODELS={}", models_dir.display());
         }
 
-        let _ = cmd.spawn();
+        match cmd.spawn() {
+            Ok(_) => info!("[assistant] ollama serve spawned"),
+            Err(e) => {
+                warn!("[assistant] failed to spawn ollama serve: {}", e);
+                return Err(AssistantError::OllamaServerDown);
+            }
+        }
 
         // Wait up to 8 s for the server to come up
-        for _ in 0..16 {
+        for i in 0..16 {
             tokio::time::sleep(Duration::from_millis(500)).await;
             if self.server_alive().await {
-                info!("[assistant] ollama server started");
+                info!("[assistant] ollama server started (attempt {})", i + 1);
                 return Ok(());
             }
         }
-        warn!("[assistant] ollama serve did not start in time");
+        warn!("[assistant] ollama serve did not start in time after 8s");
         Err(AssistantError::OllamaServerDown)
     }
 
@@ -214,7 +229,7 @@ impl OllamaBackend {
         }
 
         let (asset_name, sha256_expected) = platform_asset()?;
-        let url = format!("{}/{}/{}", ASSET_BASE_URL, OLLAMA_VERSION, asset_name);
+        let url = format!("{}/{}/{}", ASSET_BASE_URL, ASSET_RELEASE_TAG, asset_name);
         let bin_dir = self.config.data_dir.join("bin");
         tokio::fs::create_dir_all(&bin_dir).await?;
 
@@ -317,15 +332,18 @@ impl OllamaBackend {
 
 impl AssistantBackend for OllamaBackend {
     fn probe(&mut self) -> AssistantState {
-        if self.ollama_binary_present() {
+        let binary_present = self.ollama_binary_present();
+        let private_install = self.private_install_present();
+        info!("[assistant] probe: binary_present={} private_install={} data_dir={}", binary_present, private_install, self.config.data_dir.display());
+        if binary_present {
             self.state = AssistantState::ServerDown;
         } else {
             self.state = AssistantState::NeedsInstall;
         }
-        // If we have the private copy, record it
-        if self.private_install_present() {
+        if private_install {
             self.engine_managed_install = true;
         }
+        info!("[assistant] probe: state={:?} engine_managed_install={}", self.state, self.engine_managed_install);
         self.state.clone()
     }
 
@@ -409,7 +427,9 @@ impl AssistantBackend for OllamaBackend {
         token_tx: Sender<ChatToken>,
         cancel_rx: tokio::sync::oneshot::Receiver<()>,
     ) -> Result<()> {
+        info!("[assistant] chat: ensuring server running");
         self.ensure_server_running().await?;
+        info!("[assistant] chat: sending {} messages to model {}", messages.len(), self.config.model_id);
 
         let payload = serde_json::json!({
             "model": self.config.model_id,
@@ -485,6 +505,10 @@ impl AssistantBackend for OllamaBackend {
             .collect())
     }
 
+    async fn is_server_alive(&self) -> bool {
+        self.server_alive().await
+    }
+
     fn status(&self) -> AssistantState {
         self.state.clone()
     }
@@ -507,28 +531,28 @@ fn platform_asset() -> Result<(String, &'static str)> {
     #[cfg(target_os = "macos")]
     {
         return Ok((
-            format!("ollama-{}-macos-universal.zip", OLLAMA_VERSION),
+            format!("ollama-{}-macos-universal.zip", ASSET_RELEASE_TAG),
             OLLAMA_SHA256_MACOS_UNIVERSAL,
         ));
     }
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     {
         return Ok((
-            format!("ollama-{}-linux-x86_64.zip", OLLAMA_VERSION),
+            format!("ollama-{}-linux-x86_64.zip", ASSET_RELEASE_TAG),
             OLLAMA_SHA256_LINUX_X86_64,
         ));
     }
     #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
     {
         return Ok((
-            format!("ollama-{}-linux-aarch64.zip", OLLAMA_VERSION),
+            format!("ollama-{}-linux-aarch64.zip", ASSET_RELEASE_TAG),
             OLLAMA_SHA256_LINUX_AARCH64,
         ));
     }
     #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
     {
         return Ok((
-            format!("ollama-{}-windows-x86_64.zip", OLLAMA_VERSION),
+            format!("ollama-{}-windows-x86_64.zip", ASSET_RELEASE_TAG),
             OLLAMA_SHA256_WINDOWS_X86_64,
         ));
     }

@@ -204,8 +204,11 @@ impl AssistantEngine {
     /// Send a chat message grounded in the RAG index and return the full response text.
     /// Retrieves the top-5 relevant chunks, builds a system prompt, and calls the backend.
     pub async fn chat(&self, user_message: &str) -> Result<String> {
-        // Retrieve relevant context and convert to RetrievedChunk for the system prompt builder
+        tracing::info!("[assistant] chat() called with message: {:?}", &user_message[..user_message.len().min(80)]);
+        // Retrieve relevant context — falls back to empty if server not yet up or index empty.
+        // The actual server startup happens inside the backend chat() call below.
         let rows = self.retrieve(user_message, 5).await.unwrap_or_default();
+        tracing::info!("[assistant] chat() retrieved {} context chunks", rows.len());
         let chunks: Vec<backend::RetrievedChunk> = rows.into_iter().map(|r| backend::RetrievedChunk {
             text: r.text,
             source: r.source,
@@ -218,24 +221,26 @@ impl AssistantEngine {
             ChatMessage { role: "user".into(),   content: user_message.into() },
         ];
 
-        // Use a one-shot channel: send all tokens, collect into a string.
-        let (token_tx, token_rx) = std::sync::mpsc::channel::<ChatToken>();
         let (_cancel_tx, cancel_rx) = tokio::sync::oneshot::channel::<()>();
+        // Use an async channel so receiving tokens doesn't block the Tokio worker thread.
+        let (token_tx, mut token_rx) = tokio::sync::mpsc::unbounded_channel::<ChatToken>();
 
         let backend = self.backend.clone();
         let messages_clone = messages.clone();
         let handle = tokio::spawn(async move {
             let mut b = backend.lock().await;
+            tracing::info!("[assistant] chat() backend lock acquired, calling chat");
             backend::AssistantBackend::chat(&mut *b, messages_clone, token_tx, cancel_rx).await
         });
 
-        // Collect tokens synchronously from the receiver
+        // Collect tokens asynchronously — does not block the Tokio worker thread.
         let mut full_text = String::new();
-        for token in token_rx {
+        while let Some(token) = token_rx.recv().await {
             full_text.push_str(&token.text);
             if token.done { break; }
         }
         handle.await.map_err(|e| AssistantError::Internal(e.to_string()))??;
+        tracing::info!("[assistant] chat() completed, response length={}", full_text.len());
         Ok(full_text)
     }
 
@@ -245,8 +250,18 @@ impl AssistantEngine {
         let config = self.config();
         let idx = index::VectorIndex::open(&config)?;
         if idx.chunk_count()? == 0 {
+            tracing::info!("[assistant] retrieve: index empty, skipping");
             return Ok(vec![]);
         }
+        // Check server is alive before embedding — avoids hanging on a dead server.
+        tracing::info!("[assistant] retrieve: acquiring backend lock for is_server_alive");
+        let alive = self.backend.lock().await.is_server_alive().await;
+        tracing::info!("[assistant] retrieve: backend lock released, alive={}", alive);
+        if !alive {
+            tracing::info!("[assistant] retrieve: server not alive, skipping RAG context");
+            return Ok(vec![]);
+        }
+        tracing::info!("[assistant] retrieve: embedding query for top-{}", top_k);
         // Embed the query with the same model used to build the index
         let query_vec = self.backend.lock().await.embed(query).await?;
         idx.top_k(&query_vec, top_k)

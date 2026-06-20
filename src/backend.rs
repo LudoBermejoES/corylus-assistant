@@ -1,5 +1,5 @@
 use crate::{AssistantState, Result};
-use std::sync::mpsc::Sender;
+use tokio::sync::mpsc::UnboundedSender as Sender;
 
 /// A single streaming token chunk from the assistant.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -50,6 +50,9 @@ pub trait AssistantBackend: Send + Sync {
         &self,
         text: &str,
     ) -> impl std::future::Future<Output = Result<Vec<f32>>> + Send;
+
+    /// Returns true if the inference server is reachable right now (non-blocking check).
+    fn is_server_alive(&self) -> impl std::future::Future<Output = bool> + Send;
 
     /// Current readiness state.
     fn status(&self) -> AssistantState;
