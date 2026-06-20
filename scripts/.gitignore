@@ -1,0 +1,5 @@
+# Downloaded upstream archives (large, reproducible from prepare_ollama.py)
+.cache/
+
+# Repacked output zips (uploaded to GitHub Release, not committed to source)
+dist/

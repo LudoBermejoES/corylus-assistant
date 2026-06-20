@@ -27,13 +27,13 @@ pub trait AssistantBackend: Send + Sync {
     /// Perform the full install + model pull. Sends status updates via `on_status`.
     fn ensure_ready(
         &mut self,
-        on_status: impl Fn(AssistantState) + Send + 'static,
+        on_status: impl Fn(AssistantState) + Send + Sync + 'static,
     ) -> impl std::future::Future<Output = Result<()>> + Send;
 
     /// Pull (or confirm) the configured model.
     fn pull_model(
         &mut self,
-        on_status: impl Fn(AssistantState) + Send + 'static,
+        on_status: impl Fn(AssistantState) + Send + Sync + 'static,
     ) -> impl std::future::Future<Output = Result<()>> + Send;
 
     /// Stream a chat response. Tokens are sent via `token_tx`; returns when generation finishes

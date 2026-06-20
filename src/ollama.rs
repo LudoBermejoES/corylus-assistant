@@ -1,11 +1,28 @@
 //! Ollama HTTP backend implementation.
 //!
 //! Probes for an existing Ollama server, starts one if the binary is present,
-//! or reports NeedsInstall. All inference traffic stays on 127.0.0.1:11434.
+//! or provisions a private copy into `<data_dir>/bin/` from a vendored zip.
+//! All inference traffic stays on 127.0.0.1:11434.
+//!
+//! # Install strategy
+//!
+//! We never run `install.sh`, never call `sudo`, and never touch system paths.
+//! Instead, `provision_ollama()` downloads a pre-built platform zip (produced by
+//! `scripts/prepare_ollama.py` and uploaded to a GitHub Release), verifies its
+//! SHA-256, and extracts the files into `<data_dir>/bin/`.  The Ollama server is
+//! then started with `OLLAMA_MODELS=<data_dir>/models` so all model weights also
+//! live under the app's own data directory and uninstall is a simple `rm -rf`.
+//!
+//! If the user already has a system Ollama on PATH we reuse it as-is (no model
+//! relocation — they own that install).
 
+use std::path::{Path, PathBuf};
 use std::sync::mpsc::Sender;
 use std::time::Duration;
 use tracing::{info, warn};
+
+use futures_util::StreamExt;
+use sha2::{Digest, Sha256};
 
 use crate::{
     AssistantState, EngineConfig, Result,
@@ -13,15 +30,40 @@ use crate::{
     error::AssistantError,
 };
 
+// ── Asset constants ────────────────────────────────────────────────────────────
+
+const OLLAMA_VERSION: &str = "v0.30.10";
+
+// SHA-256 of the repacked zips produced by scripts/prepare_ollama.py.
+// Update these (and OLLAMA_VERSION above) whenever the script is re-run.
+const OLLAMA_SHA256_MACOS_UNIVERSAL: &str =
+    "ea8520f6d74c96629aeeee95454efa1fb9eb6b61085760ca7aac2a1b8aaa27d9";
+const OLLAMA_SHA256_LINUX_X86_64: &str =
+    "d6109b0be28b4b285ca49b435c82941f6d04cdfaadc08fa512e40a03668bb10a";
+const OLLAMA_SHA256_LINUX_AARCH64: &str =
+    "8602ed350edf273d07e357aa60c328d5b6d4a79111bb1949987aa9f2bf738489";
+const OLLAMA_SHA256_WINDOWS_X86_64: &str =
+    "abd8c08153d02d3dbe31a32c4c014397487462e4d1460f3322d05fb8c4644613";
+
+// Base URL for the vendored zips on the rust-assistant GitHub Release.
+const ASSET_BASE_URL: &str =
+    "https://github.com/LudoBermejoES/corylus-assistant/releases/download";
+
+// ── Misc constants ─────────────────────────────────────────────────────────────
+
 const OLLAMA_BASE: &str = "http://127.0.0.1:11434";
 const HEALTH_TIMEOUT_SECS: u64 = 3;
+/// Name of the version marker file written after a successful private install.
+const VERSION_FILE: &str = "ollama-version.json";
+
+// ── OllamaBackend ──────────────────────────────────────────────────────────────
 
 pub struct OllamaBackend {
     pub config: EngineConfig,
     pub state: AssistantState,
     client: reqwest::Client,
-    /// True when this engine performed the Ollama install itself, meaning we own the model store
-    /// and should set OLLAMA_MODELS to keep files under our data dir.
+    /// True when Corylus provisioned its own private Ollama binary.
+    /// In that case we set OLLAMA_MODELS so weights stay under our data dir.
     pub(crate) engine_managed_install: bool,
 }
 
@@ -39,6 +81,8 @@ impl OllamaBackend {
         }
     }
 
+    // ── Server health ──────────────────────────────────────────────────────────
+
     async fn server_alive(&self) -> bool {
         self.client
             .get(format!("{}/api/tags", OLLAMA_BASE))
@@ -53,38 +97,78 @@ impl OllamaBackend {
         if self.server_alive().await {
             return Ok(());
         }
-        // Try starting ollama serve
-        if self.ollama_binary_present() {
-            info!("[assistant] starting ollama serve");
-            let mut cmd = tokio::process::Command::new("ollama");
-            cmd.arg("serve")
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null());
-            // If we installed Ollama ourselves, point its model store under our data dir
-            // so model files are self-contained. A pre-existing install keeps its own store.
-            if self.engine_managed_install {
-                let models_dir = self.config.data_dir.join("models");
-                cmd.env("OLLAMA_MODELS", &models_dir);
-                info!("[assistant] OLLAMA_MODELS={}", models_dir.display());
-            }
-            let _ = cmd.spawn();
-            // Wait up to 8 seconds for server to come up
-            for _ in 0..16 {
-                tokio::time::sleep(Duration::from_millis(500)).await;
-                if self.server_alive().await {
-                    info!("[assistant] ollama server started");
-                    return Ok(());
-                }
-            }
-            warn!("[assistant] ollama serve did not start in time");
-            return Err(AssistantError::OllamaServerDown);
+
+        let bin = self.ollama_binary_path();
+        let Some(bin_path) = bin else {
+            return Err(AssistantError::OllamaNotInstalled);
+        };
+
+        info!("[assistant] starting ollama serve from {}", bin_path.display());
+        let mut cmd = tokio::process::Command::new(&bin_path);
+        cmd.arg("serve")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+
+        if self.engine_managed_install {
+            let models_dir = self.config.data_dir.join("models");
+            cmd.env("OLLAMA_MODELS", &models_dir);
+            // Also put the private bin dir on PATH so dylib/so resolution works
+            let bin_dir = self.config.data_dir.join("bin");
+            prepend_path_env(&mut cmd, &bin_dir);
+            info!("[assistant] OLLAMA_MODELS={}", models_dir.display());
         }
-        Err(AssistantError::OllamaNotInstalled)
+
+        let _ = cmd.spawn();
+
+        // Wait up to 8 s for the server to come up
+        for _ in 0..16 {
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            if self.server_alive().await {
+                info!("[assistant] ollama server started");
+                return Ok(());
+            }
+        }
+        warn!("[assistant] ollama serve did not start in time");
+        Err(AssistantError::OllamaServerDown)
+    }
+
+    // ── Binary detection ───────────────────────────────────────────────────────
+
+    /// Returns the path to use for `ollama` invocations, or `None` if neither
+    /// the private copy nor a system install is present.
+    ///
+    /// Priority:
+    ///   1. Private copy in `<data_dir>/bin/ollama[.exe]`  (managed by Corylus)
+    ///   2. System Ollama on PATH                           (user's own install)
+    fn ollama_binary_path(&self) -> Option<PathBuf> {
+        let private = self.private_bin_path();
+        if private.exists() {
+            return Some(private);
+        }
+        which::which("ollama").ok()
+    }
+
+    fn private_bin_path(&self) -> PathBuf {
+        let bin_name = if cfg!(target_os = "windows") { "ollama.exe" } else { "ollama" };
+        self.config.data_dir.join("bin").join(bin_name)
     }
 
     fn ollama_binary_present(&self) -> bool {
-        which::which("ollama").is_ok()
+        self.ollama_binary_path().is_some()
     }
+
+    fn private_install_present(&self) -> bool {
+        // Check the version marker so we know the install is complete, not partial.
+        let marker = self.config.data_dir.join(VERSION_FILE);
+        if !marker.exists() {
+            return false;
+        }
+        let Ok(json) = std::fs::read_to_string(&marker) else { return false; };
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(&json) else { return false; };
+        v.get("version").and_then(|s| s.as_str()) == Some(OLLAMA_VERSION)
+    }
+
+    // ── Model presence ─────────────────────────────────────────────────────────
 
     async fn model_present(&self, model_id: &str) -> bool {
         let Ok(resp) = self
@@ -104,36 +188,158 @@ impl OllamaBackend {
                 arr.iter().any(|m| {
                     m.get("name")
                         .and_then(|n| n.as_str())
-                        .map(|n| n == model_id || n.starts_with(&format!("{}:", model_id.split(':').next().unwrap_or(model_id))))
+                        .map(|n| {
+                            n == model_id
+                                || n.starts_with(&format!(
+                                    "{}:",
+                                    model_id.split(':').next().unwrap_or(model_id)
+                                ))
+                        })
                         .unwrap_or(false)
                 })
             })
             .unwrap_or(false)
     }
+
+    // ── Provision ──────────────────────────────────────────────────────────────
+
+    async fn provision_ollama(
+        &mut self,
+        on_status: &(dyn Fn(AssistantState) + Sync),
+    ) -> Result<()> {
+        if self.private_install_present() {
+            info!("[assistant] private Ollama {} already provisioned", OLLAMA_VERSION);
+            self.engine_managed_install = true;
+            return Ok(());
+        }
+
+        let (asset_name, sha256_expected) = platform_asset()?;
+        let url = format!("{}/{}/{}", ASSET_BASE_URL, OLLAMA_VERSION, asset_name);
+        let bin_dir = self.config.data_dir.join("bin");
+        tokio::fs::create_dir_all(&bin_dir).await?;
+
+        info!("[assistant] downloading Ollama from {}", url);
+
+        // ── Download with progress ────────────────────────────────────────────
+        let part_path = self.config.data_dir.join("ollama.part");
+        {
+            let resp = self
+                .client
+                .get(&url)
+                .timeout(Duration::from_secs(600))
+                .send()
+                .await
+                .map_err(AssistantError::Http)?
+                .error_for_status()
+                .map_err(AssistantError::Http)?;
+
+            let total = resp.content_length();
+            let mut downloaded: u64 = 0;
+            let mut stream = resp.bytes_stream();
+            let mut file = tokio::fs::File::create(&part_path).await?;
+
+            use tokio::io::AsyncWriteExt;
+            while let Some(chunk) = stream.next().await {
+                let chunk = chunk.map_err(AssistantError::Http)?;
+                file.write_all(&chunk).await?;
+                downloaded += chunk.len() as u64;
+                on_status(AssistantState::Downloading { downloaded, total });
+            }
+            file.flush().await?;
+        }
+
+        // ── SHA-256 verify ────────────────────────────────────────────────────
+        info!("[assistant] verifying Ollama zip checksum");
+        {
+            let data = tokio::fs::read(&part_path).await?;
+            let actual = hex::encode(Sha256::digest(&data));
+            if actual != sha256_expected {
+                let _ = tokio::fs::remove_file(&part_path).await;
+                return Err(AssistantError::OllamaInstallFailed(format!(
+                    "SHA-256 mismatch: expected {sha256_expected}, got {actual}"
+                )));
+            }
+        }
+        info!("[assistant] Ollama zip checksum ok");
+
+        // ── Extract zip into bin_dir ──────────────────────────────────────────
+        let part_path_clone = part_path.clone();
+        let bin_dir_clone = bin_dir.clone();
+        tokio::task::spawn_blocking(move || extract_zip(&part_path_clone, &bin_dir_clone))
+            .await
+            .map_err(|e| AssistantError::OllamaInstallFailed(e.to_string()))??;
+
+        let _ = tokio::fs::remove_file(&part_path).await;
+
+        // Mark executable on Unix
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let bin_name = "ollama";
+            let bin = bin_dir.join(bin_name);
+            if bin.exists() {
+                let mut perms = std::fs::metadata(&bin)?.permissions();
+                perms.set_mode(perms.mode() | 0o755);
+                std::fs::set_permissions(&bin, perms)?;
+            }
+            // Also mark dylibs/so files executable (some platforms require it)
+            for entry in std::fs::read_dir(&bin_dir)?.flatten() {
+                let p = entry.path();
+                let ext = p.extension().and_then(|e| e.to_str()).unwrap_or("");
+                if ext == "dylib" || ext == "so" {
+                    if let Ok(mut perms) = std::fs::metadata(&p).map(|m| m.permissions()) {
+                        perms.set_mode(perms.mode() | 0o755);
+                        let _ = std::fs::set_permissions(&p, perms);
+                    }
+                }
+            }
+        }
+
+        // Write version marker
+        let marker = serde_json::json!({ "version": OLLAMA_VERSION });
+        tokio::fs::write(
+            self.config.data_dir.join(VERSION_FILE),
+            serde_json::to_string_pretty(&marker)?,
+        )
+        .await?;
+
+        info!(
+            "[assistant] Ollama {} provisioned at {}",
+            OLLAMA_VERSION,
+            bin_dir.display()
+        );
+        self.engine_managed_install = true;
+        Ok(())
+    }
 }
+
+// ── AssistantBackend impl ──────────────────────────────────────────────────────
 
 impl AssistantBackend for OllamaBackend {
     fn probe(&mut self) -> AssistantState {
-        // Synchronous probe — used at startup to set initial state without blocking the UI.
-        // A running server is the most optimistic outcome; no server + no binary = needs_install.
         if self.ollama_binary_present() {
             self.state = AssistantState::ServerDown;
         } else {
             self.state = AssistantState::NeedsInstall;
+        }
+        // If we have the private copy, record it
+        if self.private_install_present() {
+            self.engine_managed_install = true;
         }
         self.state.clone()
     }
 
     async fn ensure_ready(
         &mut self,
-        on_status: impl Fn(AssistantState) + Send + 'static,
+        on_status: impl Fn(AssistantState) + Send + Sync + 'static,
     ) -> Result<()> {
         on_status(AssistantState::NotInstalled);
 
-        // Step 1: install Ollama if needed (consent already given by caller)
+        // Step 1: provision if neither private nor system Ollama is present
         if !self.ollama_binary_present() {
             on_status(AssistantState::NeedsInstall);
-            self.install_ollama().await?;
+            self.provision_ollama(&on_status).await?;
+        } else if self.private_install_present() {
             self.engine_managed_install = true;
         }
 
@@ -147,7 +353,7 @@ impl AssistantBackend for OllamaBackend {
 
     async fn pull_model(
         &mut self,
-        on_status: impl Fn(AssistantState) + Send + 'static,
+        on_status: impl Fn(AssistantState) + Send + Sync + 'static,
     ) -> Result<()> {
         self.ensure_server_running().await?;
 
@@ -170,12 +376,10 @@ impl AssistantBackend for OllamaBackend {
             .await
             .map_err(AssistantError::Http)?;
 
-        use futures_util::StreamExt;
         let mut stream = resp.bytes_stream();
 
         while let Some(chunk) = stream.next().await {
             let chunk = chunk.map_err(AssistantError::Http)?;
-            // Ollama pull stream: newline-delimited JSON with {"status","completed","total"}
             for line in chunk.split(|&b| b == b'\n') {
                 if line.is_empty() {
                     continue;
@@ -186,8 +390,7 @@ impl AssistantBackend for OllamaBackend {
                     if let Some(downloaded) = completed {
                         on_status(AssistantState::Downloading { downloaded, total });
                     }
-                    let status = val.get("status").and_then(|v| v.as_str()).unwrap_or("");
-                    if status == "success" {
+                    if val.get("status").and_then(|v| v.as_str()) == Some("success") {
                         break;
                     }
                 }
@@ -227,7 +430,6 @@ impl AssistantBackend for OllamaBackend {
             .await
             .map_err(AssistantError::Http)?;
 
-        use futures_util::StreamExt;
         let mut stream = resp.bytes_stream();
         let mut cancel_rx = cancel_rx;
 
@@ -292,92 +494,93 @@ impl AssistantBackend for OllamaBackend {
     }
 }
 
-impl OllamaBackend {
-    async fn install_ollama(&mut self) -> Result<()> {
-        #[cfg(target_os = "macos")]
-        {
-            self.install_ollama_macos().await
-        }
-        #[cfg(target_os = "linux")]
-        {
-            self.install_ollama_linux().await
-        }
-        #[cfg(target_os = "windows")]
-        {
-            self.install_ollama_windows().await
-        }
-        #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
-        {
-            Err(AssistantError::OllamaInstallFailed(
-                "Automatic Ollama install is not supported on this platform. \
-                 Please install Ollama manually from https://ollama.com"
-                    .into(),
-            ))
-        }
-    }
-
-    #[cfg(target_os = "linux")]
-    async fn install_ollama_linux(&mut self) -> Result<()> {
-        info!("[assistant] installing Ollama on Linux via install.sh");
-        let output = tokio::process::Command::new("sh")
-            .args(["-c", "curl -fsSL https://ollama.com/install.sh | sh"])
-            .output()
-            .await
-            .map_err(|e| AssistantError::OllamaInstallFailed(e.to_string()))?;
-        if !output.status.success() {
-            return Err(AssistantError::OllamaInstallFailed(
-                String::from_utf8_lossy(&output.stderr).to_string(),
-            ));
-        }
-        Ok(())
-    }
-
-    #[cfg(target_os = "macos")]
-    async fn install_ollama_macos(&mut self) -> Result<()> {
-        info!("[assistant] installing Ollama on macOS via install.sh");
-        let output = tokio::process::Command::new("sh")
-            .args(["-c", "curl -fsSL https://ollama.com/install.sh | sh"])
-            .output()
-            .await
-            .map_err(|e| AssistantError::OllamaInstallFailed(e.to_string()))?;
-        if !output.status.success() {
-            return Err(AssistantError::OllamaInstallFailed(format!(
-                "Ollama install failed. Please install manually from https://ollama.com\n{}",
-                String::from_utf8_lossy(&output.stderr)
-            )));
-        }
-        Ok(())
-    }
-
-    #[cfg(target_os = "windows")]
-    async fn install_ollama_windows(&mut self) -> Result<()> {
-        info!("[assistant] installing Ollama on Windows");
-        // Download OllamaSetup.exe to a temp path and run it (per-user, no admin required)
-        let tmp = std::env::temp_dir().join("OllamaSetup.exe");
-        let resp = reqwest::get("https://ollama.com/download/OllamaSetup.exe")
-            .await
-            .map_err(AssistantError::Http)?;
-        let bytes = resp.bytes().await.map_err(AssistantError::Http)?;
-        tokio::fs::write(&tmp, &bytes).await?;
-        let output = tokio::process::Command::new(&tmp)
-            .args(["/SILENT"])
-            .output()
-            .await
-            .map_err(|e| AssistantError::OllamaInstallFailed(e.to_string()))?;
-        if !output.status.success() {
-            return Err(AssistantError::OllamaInstallFailed(format!(
-                "OllamaSetup.exe failed. Please install manually from https://ollama.com\n{}",
-                String::from_utf8_lossy(&output.stderr)
-            )));
-        }
-        Ok(())
-    }
-}
-
 impl crate::rag::AsyncEmbedFn for OllamaBackend {
     async fn embed(&self, text: &str) -> crate::Result<Vec<f32>> {
         AssistantBackend::embed(self, text).await
     }
+}
+
+// ── Helpers ────────────────────────────────────────────────────────────────────
+
+/// Returns `(asset_filename, expected_sha256)` for the current platform/arch.
+fn platform_asset() -> Result<(String, &'static str)> {
+    #[cfg(target_os = "macos")]
+    {
+        return Ok((
+            format!("ollama-{}-macos-universal.zip", OLLAMA_VERSION),
+            OLLAMA_SHA256_MACOS_UNIVERSAL,
+        ));
+    }
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    {
+        return Ok((
+            format!("ollama-{}-linux-x86_64.zip", OLLAMA_VERSION),
+            OLLAMA_SHA256_LINUX_X86_64,
+        ));
+    }
+    #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+    {
+        return Ok((
+            format!("ollama-{}-linux-aarch64.zip", OLLAMA_VERSION),
+            OLLAMA_SHA256_LINUX_AARCH64,
+        ));
+    }
+    #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
+    {
+        return Ok((
+            format!("ollama-{}-windows-x86_64.zip", OLLAMA_VERSION),
+            OLLAMA_SHA256_WINDOWS_X86_64,
+        ));
+    }
+    #[allow(unreachable_code)]
+    Err(AssistantError::OllamaInstallFailed(
+        "Automatic Ollama install is not supported on this platform. \
+         Please install Ollama manually from https://ollama.com"
+            .into(),
+    ))
+}
+
+/// Extract all entries from a zip into `dest_dir`, preserving subdirectory
+/// structure.  This is used both for platform zips (flat or with lib/ subdir)
+/// and any future layout.
+fn extract_zip(zip_path: &Path, dest_dir: &Path) -> Result<()> {
+    let file = std::fs::File::open(zip_path)
+        .map_err(|e| AssistantError::OllamaInstallFailed(format!("open zip: {e}")))?;
+    let mut archive = zip::ZipArchive::new(file)
+        .map_err(|e| AssistantError::OllamaInstallFailed(format!("read zip: {e}")))?;
+
+    for i in 0..archive.len() {
+        let mut entry = archive
+            .by_index(i)
+            .map_err(|e| AssistantError::OllamaInstallFailed(format!("zip entry {i}: {e}")))?;
+
+        if entry.is_dir() {
+            continue;
+        }
+
+        // Normalise path separators and strip any leading "." or absolute prefix
+        let entry_name = entry.name().replace('\\', "/");
+        let entry_name = entry_name.trim_start_matches("./").trim_start_matches('/');
+
+        let out_path = dest_dir.join(entry_name);
+        if let Some(parent) = out_path.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| AssistantError::OllamaInstallFailed(format!("mkdir {}: {e}", parent.display())))?;
+        }
+
+        let mut out = std::fs::File::create(&out_path)
+            .map_err(|e| AssistantError::OllamaInstallFailed(format!("create {}: {e}", out_path.display())))?;
+        std::io::copy(&mut entry, &mut out)
+            .map_err(|e| AssistantError::OllamaInstallFailed(format!("extract {entry_name}: {e}")))?;
+    }
+    Ok(())
+}
+
+/// Prepend `dir` to the PATH environment variable for a spawned command.
+fn prepend_path_env(cmd: &mut tokio::process::Command, dir: &Path) {
+    let current = std::env::var("PATH").unwrap_or_default();
+    let sep = if cfg!(target_os = "windows") { ";" } else { ":" };
+    cmd.env("PATH", format!("{}{sep}{current}", dir.display()));
 }
 
 fn detect_system_ram() -> Option<u64> {
@@ -386,11 +589,7 @@ fn detect_system_ram() -> Option<u64> {
         let data = std::fs::read_to_string("/proc/meminfo").ok()?;
         for line in data.lines() {
             if line.starts_with("MemTotal:") {
-                let kb: u64 = line
-                    .split_whitespace()
-                    .nth(1)?
-                    .parse()
-                    .ok()?;
+                let kb: u64 = line.split_whitespace().nth(1)?.parse().ok()?;
                 return Some(kb * 1024);
             }
         }
@@ -406,7 +605,6 @@ fn detect_system_ram() -> Option<u64> {
     }
     #[cfg(target_os = "windows")]
     {
-        // Use GlobalMemoryStatusEx via winapi — fall back to None for now
         None
     }
     #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
