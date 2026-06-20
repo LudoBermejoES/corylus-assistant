@@ -173,6 +173,13 @@ impl AssistantEngine {
             idx.check_model_compatibility(&config)?;
         }
 
+        // Ensure the Ollama server is running before starting the embed loop.
+        // Without this, all embed calls fail with connection refused if the server
+        // hasn't been started yet (e.g. indexing triggered before any chat).
+        tracing::info!("[assistant] index_project: ensuring server running before embedding");
+        self.backend.lock().await.ensure_server_running().await?;
+        tracing::info!("[assistant] index_project: server ready, starting embed loop");
+
         // The embed closure captures a clone of the backend Arc so it can be called
         // from within the async indexing loop without holding any outer lock.
         let backend = self.backend.clone();
