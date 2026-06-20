@@ -62,14 +62,15 @@ pub fn chunk_text(source: &str, text: &str, window: usize, overlap: usize, min_l
 }
 
 /// Find a sentence-end boundary (`. `, `? `, `! `, `\n\n`) near `target_idx`
-/// within `text`, searching forward up to 120 chars. Returns the index after the boundary.
+/// within `text`, searching forward. Returns the **char index** after the boundary.
+/// `target_idx` is a char index into `text`.
 fn find_sentence_end(text: &str, target_idx: usize) -> Option<usize> {
-    let bytes = text.as_bytes();
-    let search_start = target_idx.min(bytes.len().saturating_sub(1));
-    for i in search_start..bytes.len().saturating_sub(1) {
-        match (bytes[i], bytes[i + 1]) {
-            (b'.', b' ') | (b'?', b' ') | (b'!', b' ') => return Some(i + 2),
-            (b'\n', b'\n') => return Some(i + 2),
+    let chars: Vec<char> = text.chars().collect();
+    let search_start = target_idx.min(chars.len().saturating_sub(1));
+    for i in search_start..chars.len().saturating_sub(1) {
+        match (chars[i], chars[i + 1]) {
+            ('.', ' ') | ('?', ' ') | ('!', ' ') => return Some(i + 2),
+            ('\n', '\n') => return Some(i + 2),
             _ => {}
         }
     }
