@@ -6,7 +6,7 @@ mod tests {
         EngineConfig {
             data_dir: data_dir.to_path_buf(),
             model_id: "qwen3:test".into(),
-            embedding_model: "nomic-embed-text".into(),
+            embedding_model: "qwen3:test".into(),
             ollama_endpoint: "http://127.0.0.1:11434".into(),
             context_window: 4096,
         }
