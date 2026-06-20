@@ -98,7 +98,7 @@ impl OllamaBackend {
         alive
     }
 
-    async fn ensure_server_running(&mut self) -> Result<()> {
+    pub(crate) async fn ensure_server_running(&mut self) -> Result<()> {
         info!("[assistant] ensure_server_running: checking if server is alive");
         if self.server_alive().await {
             info!("[assistant] ensure_server_running: server already alive");
