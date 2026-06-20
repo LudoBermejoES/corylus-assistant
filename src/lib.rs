@@ -123,7 +123,7 @@ impl AssistantEngine {
         ModelInfo {
             model_id: tier.default_model().into(),
             download_size_bytes: tier.default_model_size_bytes(),
-            ram_tier: tier,
+            ram_tier: format!("{:?}", tier).to_lowercase(),
         }
     }
 

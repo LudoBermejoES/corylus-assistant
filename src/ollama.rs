@@ -9,7 +9,7 @@ use tracing::{info, warn};
 
 use crate::{
     AssistantState, EngineConfig, Result,
-    backend::{AssistantBackend, ChatMessage, ChatToken, RamTier},
+    backend::{AssistantBackend, ChatMessage, ChatToken},
     error::AssistantError,
 };
 
