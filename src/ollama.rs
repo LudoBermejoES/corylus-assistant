@@ -98,6 +98,36 @@ impl OllamaBackend {
         alive
     }
 
+    /// Pull the embedding model if it is not yet present. Safe to call on every index.
+    pub(crate) async fn ensure_embedding_model(&self) -> Result<()> {
+        let embed_id = self.config.embedding_model.clone();
+        if self.model_present(&embed_id).await {
+            return Ok(());
+        }
+        info!("[assistant] embedding model {} not present, pulling now", embed_id);
+        let resp = self
+            .client
+            .post(format!("{}/api/pull", OLLAMA_BASE))
+            .json(&serde_json::json!({ "name": embed_id, "stream": true }))
+            .send()
+            .await
+            .map_err(AssistantError::Http)?;
+        let mut stream = resp.bytes_stream();
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.map_err(AssistantError::Http)?;
+            for line in chunk.split(|&b| b == b'\n') {
+                if line.is_empty() { continue; }
+                if let Ok(val) = serde_json::from_slice::<serde_json::Value>(line) {
+                    if val.get("status").and_then(|v| v.as_str()) == Some("success") {
+                        break;
+                    }
+                }
+            }
+        }
+        info!("[assistant] embedding model {} ready", embed_id);
+        Ok(())
+    }
+
     pub(crate) async fn ensure_server_running(&mut self) -> Result<()> {
         info!("[assistant] ensure_server_running: checking if server is alive");
         if self.server_alive().await {

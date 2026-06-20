@@ -177,7 +177,13 @@ impl AssistantEngine {
         // Without this, all embed calls fail with connection refused if the server
         // hasn't been started yet (e.g. indexing triggered before any chat).
         tracing::info!("[assistant] index_project: ensuring server running before embedding");
-        self.backend.lock().await.ensure_server_running().await?;
+        {
+            let mut b = self.backend.lock().await;
+            b.ensure_server_running().await?;
+            // Pull the embedding model if not yet present (e.g. existing installs that
+            // predate the auto-pull logic, or first index after a fresh chat-model install).
+            b.ensure_embedding_model().await?;
+        }
         tracing::info!("[assistant] index_project: server ready, starting embed loop");
 
         // The embed closure captures a clone of the backend Arc so it can be called
