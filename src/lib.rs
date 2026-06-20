@@ -12,6 +12,7 @@ mod state;
 mod backend;
 mod ollama;
 mod provision;
+pub mod catalog;
 pub mod rag;
 pub mod index;
 
@@ -23,6 +24,7 @@ pub use state::AssistantState;
 pub use backend::{AssistantBackend, ChatMessage, ChatToken, RamTier, RetrievedChunk, build_system_prompt};
 pub use ollama::OllamaBackend;
 pub use index::{VectorIndex, RetrievedRow};
+pub use catalog::{ModelEntry, CATALOG};
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -116,6 +118,24 @@ impl AssistantEngine {
 
     pub fn config(&self) -> EngineConfig {
         self.inner.lock().unwrap().config.clone()
+    }
+
+    /// Override the chat model ID. Takes effect on the next chat/provision call.
+    pub fn set_model_id(&self, model_id: String) {
+        let mut g = self.inner.lock().unwrap();
+        g.config.model_id = model_id.clone();
+        if let Ok(mut b) = self.backend.try_lock() {
+            b.config.model_id = model_id;
+        }
+    }
+
+    /// Override the embedding model ID. Takes effect on the next index/embed call.
+    pub fn set_embedding_model(&self, embedding_model: String) {
+        let mut g = self.inner.lock().unwrap();
+        g.config.embedding_model = embedding_model.clone();
+        if let Ok(mut b) = self.backend.try_lock() {
+            b.config.embedding_model = embedding_model;
+        }
     }
 
     /// Begin provisioning (install Ollama + pull model). Consent must be given before calling.
