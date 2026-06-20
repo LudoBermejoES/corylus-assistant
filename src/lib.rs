@@ -194,6 +194,51 @@ impl AssistantEngine {
         }
     }
 
+    /// Return the number of indexed chunks (0 = index empty or not yet built).
+    pub fn chunk_count(&self) -> Result<usize> {
+        let config = self.config();
+        let idx = index::VectorIndex::open(&config)?;
+        Ok(idx.chunk_count()?)
+    }
+
+    /// Send a chat message grounded in the RAG index and return the full response text.
+    /// Retrieves the top-5 relevant chunks, builds a system prompt, and calls the backend.
+    pub async fn chat(&self, user_message: &str) -> Result<String> {
+        // Retrieve relevant context and convert to RetrievedChunk for the system prompt builder
+        let rows = self.retrieve(user_message, 5).await.unwrap_or_default();
+        let chunks: Vec<backend::RetrievedChunk> = rows.into_iter().map(|r| backend::RetrievedChunk {
+            text: r.text,
+            source: r.source,
+            score: (1.0 - r.distance as f32).max(0.0),
+        }).collect();
+        let system_prompt = backend::build_system_prompt(&chunks);
+
+        let messages = vec![
+            ChatMessage { role: "system".into(), content: system_prompt },
+            ChatMessage { role: "user".into(),   content: user_message.into() },
+        ];
+
+        // Use a one-shot channel: send all tokens, collect into a string.
+        let (token_tx, token_rx) = std::sync::mpsc::channel::<ChatToken>();
+        let (_cancel_tx, cancel_rx) = tokio::sync::oneshot::channel::<()>();
+
+        let backend = self.backend.clone();
+        let messages_clone = messages.clone();
+        let handle = tokio::spawn(async move {
+            let mut b = backend.lock().await;
+            backend::AssistantBackend::chat(&mut *b, messages_clone, token_tx, cancel_rx).await
+        });
+
+        // Collect tokens synchronously from the receiver
+        let mut full_text = String::new();
+        for token in token_rx {
+            full_text.push_str(&token.text);
+            if token.done { break; }
+        }
+        handle.await.map_err(|e| AssistantError::Internal(e.to_string()))??;
+        Ok(full_text)
+    }
+
     /// Retrieve the top-K most relevant chunks for `query`, using the RAG index.
     /// Returns an empty vec when the index has no content or the engine isn't ready.
     pub async fn retrieve(&self, query: &str, top_k: usize) -> Result<Vec<RetrievedRow>> {
