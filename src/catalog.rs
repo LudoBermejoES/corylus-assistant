@@ -157,4 +157,60 @@ mod tests {
     fn default_embedding_model_in_catalog() {
         assert!(CATALOG.iter().any(|e| e.id == "nomic-embed-text" && e.role == "embedding"));
     }
+
+    #[test]
+    fn all_model_roles_are_chat_or_embedding() {
+        for entry in CATALOG {
+            assert!(
+                entry.role == "chat" || entry.role == "embedding",
+                "unexpected role '{}' for model '{}'",
+                entry.role,
+                entry.id,
+            );
+        }
+    }
+
+    #[test]
+    fn catalog_contains_recent_models() {
+        let ids: Vec<&str> = CATALOG.iter().map(|e| e.id).collect();
+        // Models added in the 2025 catalog expansion
+        assert!(ids.contains(&"gemma3:4b"), "gemma3:4b must be in catalog");
+        assert!(ids.contains(&"gemma3:12b"), "gemma3:12b must be in catalog");
+        assert!(ids.contains(&"llama3.2:3b"), "llama3.2:3b must be in catalog");
+        assert!(ids.contains(&"deepseek-r1:7b"), "deepseek-r1:7b must be in catalog");
+        assert!(ids.contains(&"deepseek-r1:14b"), "deepseek-r1:14b must be in catalog");
+        assert!(ids.contains(&"mxbai-embed-large"), "mxbai-embed-large must be in catalog");
+    }
+
+    #[test]
+    fn catalog_ram_requirements_are_positive() {
+        for entry in CATALOG {
+            assert!(
+                entry.min_ram_gb >= 2,
+                "min_ram_gb for '{}' should be at least 2 GB, got {}",
+                entry.id,
+                entry.min_ram_gb,
+            );
+        }
+    }
+
+    #[test]
+    fn chat_models_are_larger_than_embedding_models() {
+        let max_embed = CATALOG
+            .iter()
+            .filter(|e| e.role == "embedding")
+            .map(|e| e.size_gb)
+            .fold(0.0_f32, f32::max);
+        let min_chat = CATALOG
+            .iter()
+            .filter(|e| e.role == "chat")
+            .map(|e| e.size_gb)
+            .fold(f32::MAX, f32::min);
+        assert!(
+            min_chat > max_embed,
+            "smallest chat model ({} GB) should be larger than largest embedding model ({} GB)",
+            min_chat,
+            max_embed,
+        );
+    }
 }
