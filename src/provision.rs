@@ -4,6 +4,7 @@
 //! writes the version sentinel when the model is confirmed ready.
 
 use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, Ordering};
 use tracing::info;
 
 use crate::{
@@ -11,6 +12,7 @@ use crate::{
     backend::AssistantBackend,
     ollama::OllamaBackend,
     state::{VersionFile, SCHEMA_VERSION, version_path},
+    error::AssistantError,
 };
 
 /// Run the full provision sequence: Ollama install (if needed + consented) → model pull.
@@ -21,6 +23,7 @@ use crate::{
 pub async fn run(
     inner: Arc<Mutex<Inner>>,
     backend: Arc<tokio::sync::Mutex<OllamaBackend>>,
+    cancel: Arc<AtomicBool>,
     on_progress: impl Fn(AssistantState) + Send + Sync + 'static,
 ) -> Result<()> {
     let config = {
@@ -39,6 +42,7 @@ pub async fn run(
     let inner2 = inner.clone();
     {
         let mut b = backend.lock().await;
+        b.set_cancel(cancel);
         b.ensure_ready(move |s| {
             inner2.lock().unwrap().state = s.clone();
             on_progress2(s);

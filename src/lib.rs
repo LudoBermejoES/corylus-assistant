@@ -28,6 +28,7 @@ pub use catalog::{ModelEntry, CATALOG};
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 pub type Result<T> = std::result::Result<T, AssistantError>;
 
@@ -73,6 +74,7 @@ pub(crate) struct Inner {
 pub struct AssistantEngine {
     inner: Arc<Mutex<Inner>>,
     backend: Arc<tokio::sync::Mutex<OllamaBackend>>,
+    cancel_pull: Arc<AtomicBool>,
 }
 
 impl AssistantEngine {
@@ -84,7 +86,13 @@ impl AssistantEngine {
                 config,
             })),
             backend: Arc::new(tokio::sync::Mutex::new(backend)),
+            cancel_pull: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    /// Signal any in-progress model pull to stop after the current chunk.
+    pub fn cancel_pull(&self) {
+        self.cancel_pull.store(true, Ordering::Relaxed);
     }
 
     /// Update data dir. Called from app setup once the resolved app-data dir is known.
@@ -127,6 +135,8 @@ impl AssistantEngine {
         if let Ok(mut b) = self.backend.try_lock() {
             b.config.model_id = model_id;
         }
+        // If try_lock failed (backend busy), the backend config is synced from inner.config
+        // at the start of every chat() and provision() call.
     }
 
     /// Override the embedding model ID. Takes effect on the next index/embed call.
@@ -136,6 +146,7 @@ impl AssistantEngine {
         if let Ok(mut b) = self.backend.try_lock() {
             b.config.embedding_model = embedding_model;
         }
+        // If try_lock failed, the backend config is synced from inner.config at call time.
     }
 
     /// Begin provisioning (install Ollama + pull model). Consent must be given before calling.
@@ -143,7 +154,8 @@ impl AssistantEngine {
         &self,
         on_progress: impl Fn(AssistantState) + Send + Sync + 'static,
     ) -> Result<()> {
-        provision::run(self.inner.clone(), self.backend.clone(), on_progress).await
+        self.cancel_pull.store(false, Ordering::Relaxed);
+        provision::run(self.inner.clone(), self.backend.clone(), self.cancel_pull.clone(), on_progress).await
     }
 
     /// Detect available system RAM (best-effort).
@@ -270,10 +282,14 @@ impl AssistantEngine {
         // Use an async channel so receiving tokens doesn't block the Tokio worker thread.
         let (token_tx, mut token_rx) = tokio::sync::mpsc::unbounded_channel::<ChatToken>();
 
+        // Sync model_id from inner.config into the backend at call time.
+        // This ensures set_model_id() always takes effect even if try_lock failed earlier.
+        let model_id = self.inner.lock().unwrap().config.model_id.clone();
         let backend = self.backend.clone();
         let messages_clone = messages.clone();
         let handle = tokio::spawn(async move {
             let mut b = backend.lock().await;
+            b.config.model_id = model_id;
             tracing::info!("[assistant] chat() backend lock acquired, calling chat");
             backend::AssistantBackend::chat(&mut *b, messages_clone, token_tx, cancel_rx).await
         });

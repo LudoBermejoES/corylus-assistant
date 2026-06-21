@@ -17,9 +17,11 @@
 //! relocation — they own that install).
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use tokio::sync::mpsc::UnboundedSender as Sender;
-use tracing::{info, warn};
+use tracing::{info, warn, error};
 
 use futures_util::StreamExt;
 use sha2::{Digest, Sha256};
@@ -68,6 +70,8 @@ pub struct OllamaBackend {
     /// True when Corylus provisioned its own private Ollama binary.
     /// In that case we set OLLAMA_MODELS so weights stay under our data dir.
     pub(crate) engine_managed_install: bool,
+    /// Set to true by the engine to abort an in-progress pull after the current chunk.
+    cancel: Arc<AtomicBool>,
 }
 
 impl OllamaBackend {
@@ -81,7 +85,12 @@ impl OllamaBackend {
             config,
             client,
             engine_managed_install: false,
+            cancel: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    pub fn set_cancel(&mut self, cancel: Arc<AtomicBool>) {
+        self.cancel = cancel;
     }
 
     // ── Server health ──────────────────────────────────────────────────────────
@@ -227,6 +236,9 @@ impl OllamaBackend {
         let Ok(body) = resp.json::<serde_json::Value>().await else {
             return false;
         };
+        // Match exact tag (e.g. "qwen3:14b") or tag-less name matching ":latest"
+        // (e.g. model_id "nomic-embed-text" matches "nomic-embed-text:latest").
+        // Do NOT use prefix matching — "qwen3:1.7b" must not satisfy "qwen3:14b".
         body.get("models")
             .and_then(|m| m.as_array())
             .map(|arr| {
@@ -235,10 +247,8 @@ impl OllamaBackend {
                         .and_then(|n| n.as_str())
                         .map(|n| {
                             n == model_id
-                                || n.starts_with(&format!(
-                                    "{}:",
-                                    model_id.split(':').next().unwrap_or(model_id)
-                                ))
+                                || (!model_id.contains(':')
+                                    && n == &format!("{}:latest", model_id))
                         })
                         .unwrap_or(false)
                 })
@@ -459,13 +469,20 @@ impl AssistantBackend for OllamaBackend {
             .client
             .post(format!("{}/api/pull", OLLAMA_BASE))
             .json(&serde_json::json!({ "name": model_id, "stream": true }))
+            .timeout(Duration::from_secs(3600))
             .send()
             .await
             .map_err(AssistantError::Http)?;
 
         let mut stream = resp.bytes_stream();
 
-        while let Some(chunk) = stream.next().await {
+        let mut cancelled = false;
+        'stream: while let Some(chunk) = stream.next().await {
+            if self.cancel.load(Ordering::Relaxed) {
+                info!("[assistant] pull cancelled by user");
+                cancelled = true;
+                break 'stream;
+            }
             let chunk = chunk.map_err(AssistantError::Http)?;
             for line in chunk.split(|&b| b == b'\n') {
                 if line.is_empty() {
@@ -478,10 +495,16 @@ impl AssistantBackend for OllamaBackend {
                         on_status(AssistantState::Downloading { downloaded, total });
                     }
                     if val.get("status").and_then(|v| v.as_str()) == Some("success") {
-                        break;
+                        break 'stream;
                     }
                 }
             }
+        }
+
+        if cancelled {
+            self.state = AssistantState::ServerDown;
+            on_status(AssistantState::ServerDown);
+            return Err(AssistantError::Internal("Download cancelled".into()));
         }
 
         self.state = AssistantState::Ready;
@@ -500,6 +523,7 @@ impl AssistantBackend for OllamaBackend {
                     .client
                     .post(format!("{}/api/pull", OLLAMA_BASE))
                     .json(&serde_json::json!({ "name": embed_id, "stream": true }))
+                    .timeout(Duration::from_secs(3600))
                     .send()
                     .await
                     .map_err(AssistantError::Http)?;
@@ -555,6 +579,13 @@ impl AssistantBackend for OllamaBackend {
             .send()
             .await
             .map_err(AssistantError::Http)?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            error!("[assistant] chat: Ollama returned HTTP {}: {}", status, body);
+            return Err(AssistantError::Internal(format!("Ollama chat error {}: {}", status, body)));
+        }
 
         let mut stream = resp.bytes_stream();
         let mut cancel_rx = cancel_rx;
