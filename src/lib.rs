@@ -174,6 +174,18 @@ impl AssistantEngine {
         Ok(())
     }
 
+    /// Return names of all locally downloaded Ollama models.
+    pub async fn list_local_models(&self) -> Result<Vec<String>> {
+        let b = self.backend.lock().await;
+        b.list_local_models().await
+    }
+
+    /// Delete a model from Ollama's local store.
+    pub async fn delete_model(&self, model_id: String) -> Result<()> {
+        let b = self.backend.lock().await;
+        b.delete_model(&model_id).await
+    }
+
     /// Index a set of project documents for RAG retrieval.
     ///
     /// `documents` is a list of `(relative_path, plain_text_content)` pairs.

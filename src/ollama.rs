@@ -246,6 +246,45 @@ impl OllamaBackend {
             .unwrap_or(false)
     }
 
+    /// Return the names of all locally downloaded Ollama models.
+    pub async fn list_local_models(&self) -> Result<Vec<String>> {
+        let resp = self
+            .client
+            .get(format!("{}/api/tags", OLLAMA_BASE))
+            .send()
+            .await?;
+        let body = resp.json::<serde_json::Value>().await?;
+        let names = body
+            .get("models")
+            .and_then(|m| m.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|m| m.get("name").and_then(|n| n.as_str()).map(String::from))
+                    .collect()
+            })
+            .unwrap_or_default();
+        Ok(names)
+    }
+
+    /// Delete a model from Ollama's local store (calls `DELETE /api/delete`).
+    pub async fn delete_model(&self, model_id: &str) -> Result<()> {
+        let resp = self
+            .client
+            .delete(format!("{}/api/delete", OLLAMA_BASE))
+            .json(&serde_json::json!({ "name": model_id }))
+            .send()
+            .await?;
+        if resp.status().is_success() {
+            Ok(())
+        } else {
+            let msg = resp.text().await.unwrap_or_default();
+            Err(AssistantError::OllamaInstallFailed(format!(
+                "delete failed: {}",
+                msg
+            )))
+        }
+    }
+
     // ── Provision ──────────────────────────────────────────────────────────────
 
     async fn provision_ollama(
