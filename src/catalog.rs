@@ -17,40 +17,112 @@ pub struct ModelEntry {
 
 /// Curated catalog of supported Ollama models.
 ///
-/// Chat models use the Qwen3 family (Apache 2.0); embedding model is nomic-embed-text (Apache 2.0).
-/// Sizes are approximate GGUF Q4 download sizes. All models are offline after first pull.
+/// Chat models: Qwen3 (Apache 2.0), Gemma 3 (Gemma ToU), Llama 3.2 (Meta Community License),
+/// Mistral Small (Apache 2.0), DeepSeek-R1 distills (MIT/Apache 2.0).
+/// Embedding: nomic-embed-text (Apache 2.0), mxbai-embed-large (Apache 2.0).
+/// Sizes are approximate GGUF Q4_K_M download sizes. All models run offline after first pull.
 pub const CATALOG: &[ModelEntry] = &[
+    // ── Qwen3 family (Alibaba, released April 2025) ──────────────────────────
     ModelEntry {
         id: "qwen3:1.7b",
-        display_name: "Qwen3 1.7B (Small)",
+        display_name: "Qwen3 1.7B",
         role: "chat",
         size_gb: 1.1,
         min_ram_gb: 4,
-        description: "Fastest model; ideal for 4–8 GB RAM machines. Good for simple questions.",
+        description: "Fastest response; great for quick questions on 4–8 GB RAM machines.",
+    },
+    ModelEntry {
+        id: "qwen3:4b",
+        display_name: "Qwen3 4B",
+        role: "chat",
+        size_gb: 2.6,
+        min_ram_gb: 6,
+        description: "Good quality on modest hardware; solid choice for 8 GB RAM machines.",
     },
     ModelEntry {
         id: "qwen3:8b",
-        display_name: "Qwen3 8B (Balanced)",
+        display_name: "Qwen3 8B",
         role: "chat",
         size_gb: 5.2,
         min_ram_gb: 10,
-        description: "Best balance of quality and speed for 16 GB RAM machines.",
+        description: "Best balance of quality and speed; recommended for 16 GB RAM.",
     },
     ModelEntry {
         id: "qwen3:14b",
-        display_name: "Qwen3 14B (Large)",
+        display_name: "Qwen3 14B",
         role: "chat",
         size_gb: 9.0,
         min_ram_gb: 20,
-        description: "Highest quality responses; requires 20+ GB RAM.",
+        description: "High quality writing assistance; needs 20+ GB RAM.",
     },
+    // ── Gemma 3 family (Google, released March 2025) ─────────────────────────
+    ModelEntry {
+        id: "gemma3:4b",
+        display_name: "Gemma 3 4B",
+        role: "chat",
+        size_gb: 3.3,
+        min_ram_gb: 6,
+        description: "Google's compact model; strong instruction following on 8 GB RAM.",
+    },
+    ModelEntry {
+        id: "gemma3:12b",
+        display_name: "Gemma 3 12B",
+        role: "chat",
+        size_gb: 8.1,
+        min_ram_gb: 14,
+        description: "Google's mid-size model; excellent writing quality for 16 GB RAM.",
+    },
+    // ── Llama 3.2 family (Meta, released September 2024) ────────────────────
+    ModelEntry {
+        id: "llama3.2:3b",
+        display_name: "Llama 3.2 3B",
+        role: "chat",
+        size_gb: 2.0,
+        min_ram_gb: 6,
+        description: "Meta's lightweight model; fast and capable on any modern laptop.",
+    },
+    // ── Mistral Small (Mistral AI, released January 2025) ────────────────────
+    ModelEntry {
+        id: "mistral-small3.1:24b",
+        display_name: "Mistral Small 3.1 24B",
+        role: "chat",
+        size_gb: 14.0,
+        min_ram_gb: 24,
+        description: "Mistral's latest compact model; near-frontier quality for 32 GB RAM machines.",
+    },
+    // ── DeepSeek-R1 distills (DeepSeek, released January 2025) ──────────────
+    ModelEntry {
+        id: "deepseek-r1:7b",
+        display_name: "DeepSeek R1 7B",
+        role: "chat",
+        size_gb: 4.7,
+        min_ram_gb: 8,
+        description: "Reasoning-focused model; thinks step by step before answering. Good for 16 GB RAM.",
+    },
+    ModelEntry {
+        id: "deepseek-r1:14b",
+        display_name: "DeepSeek R1 14B",
+        role: "chat",
+        size_gb: 9.0,
+        min_ram_gb: 16,
+        description: "Stronger reasoning distill; excellent for complex creative problems on 24 GB RAM.",
+    },
+    // ── Embedding models ─────────────────────────────────────────────────────
     ModelEntry {
         id: "nomic-embed-text",
         display_name: "Nomic Embed Text",
         role: "embedding",
         size_gb: 0.27,
         min_ram_gb: 2,
-        description: "Dedicated embedding model for project indexing. Small and fast.",
+        description: "Fast, lightweight embedding model for project indexing. Recommended default.",
+    },
+    ModelEntry {
+        id: "mxbai-embed-large",
+        display_name: "MixedBread Embed Large",
+        role: "embedding",
+        size_gb: 0.67,
+        min_ram_gb: 2,
+        description: "Higher accuracy embeddings; better search results at a small size cost.",
     },
 ];
 
