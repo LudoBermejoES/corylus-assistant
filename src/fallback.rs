@@ -9,6 +9,8 @@
 
 use serde::Deserialize;
 
+use crate::actions::ProposedAction;
+
 // ── Corpus ─────────────────────────────────────────────────────────────────
 
 const CORPUS_JSON: &str =
@@ -29,13 +31,17 @@ struct CorpusEntry {
 pub struct FallbackResponse {
     pub text: String,
     pub source: &'static str,
+    /// When a turn resolves to an action, this carries the proposed action.
+    pub action: Option<ProposedAction>,
 }
 
 impl FallbackResponse {
-    fn llm() -> Self { Self { text: String::new(), source: "llm" } }
-
     fn fallback(text: impl Into<String>) -> Self {
-        Self { text: text.into(), source: "fallback" }
+        Self { text: text.into(), source: "fallback", action: None }
+    }
+
+    fn action(action: ProposedAction, text: impl Into<String>) -> Self {
+        Self { text: text.into(), source: "fallback", action: Some(action) }
     }
 }
 
@@ -156,20 +162,17 @@ impl FallbackEngine {
                 let scope = s.slots.get(1).cloned().unwrap_or_default();
                 let text = if lang == "es" {
                     format!(
-                        "Para compilar en {fmt} ({scope}): abre el panel Compilar \
-                        → elige {fmt} → selecciona el alcance → haz clic en Compilar. \
-                        El archivo exportado se guardará en tu carpeta de exportación. \
-                        (Escribe 'cancelar' para salir en cualquier momento.)"
+                        "Abriendo el panel Compilar con el formato {fmt} ({scope}) preseleccionado."
                     )
                 } else {
                     format!(
-                        "To compile to {fmt} ({scope}): open the Compile panel \
-                        → choose {fmt} → select the scope → click Compile. \
-                        The exported file will be saved to your export folder. \
-                        (Type 'cancel' to exit at any time.)"
+                        "Opening the Compile panel with {fmt} ({scope}) pre-filled."
                     )
                 };
-                Some(FallbackResponse::fallback(text))
+                let action = FallbackEngine::compile_slots_to_action(&fmt, &scope);
+                let mut resp = FallbackResponse::fallback(text);
+                resp.action = Some(action);
+                Some(resp)
             }
             _ => None,
         }
@@ -250,6 +253,8 @@ impl FallbackEngine {
     pub fn detect_flow(&self, text: &str, lang: &str) -> Option<(FsmFlow, FallbackResponse)> {
         let lower = text.to_lowercase();
 
+        // compile_kw must NOT appear in action intent signals so there's no overlap.
+        // The action detector runs first; only if no action is detected do we enter the FSM.
         let compile_kw = ["compil", "export", "pdf", "epub", "docx", "microsoft word", " .docx"];
         let binder_kw = ["binder", "carpeta", "folder"];
         let project_kw = ["new project", "nuevo proyecto", "create project", "crear proyecto"];
@@ -282,6 +287,72 @@ impl FallbackEngine {
         }
 
         None
+    }
+
+    /// Detect if the user message expresses intent to perform a recognized **action**.
+    ///
+    /// Returns a `FallbackResponse` carrying a `ProposedAction` when an action is
+    /// detected, or `None` when the message is plain Q&A (no action intent).
+    ///
+    /// Action detection runs BEFORE `detect_flow` / FSM so that "compile" and similar
+    /// keywords go to the action path when the mascot is active.
+    pub fn detect_action(&self, text: &str, lang: &str) -> Option<FallbackResponse> {
+        use crate::actions::ACTION_CATALOG;
+
+        let lower = text.to_lowercase();
+
+        // Extract an optional compile-format hint from the message.
+        fn extract_format(lower: &str) -> Option<String> {
+            for fmt in &["pdf", "epub", "docx"] {
+                if lower.contains(fmt) {
+                    return Some(fmt.to_uppercase());
+                }
+            }
+            None
+        }
+
+        for entry in ACTION_CATALOG {
+            if entry.intent_signals.iter().any(|sig| lower.contains(sig)) {
+                let summary = if lang == "es" { entry.summary_es } else { entry.summary };
+
+                // Build args from context collected in the message.
+                let args = if entry.name == "open_compile_panel" {
+                    let fmt = extract_format(&lower);
+                    serde_json::json!({ "format": fmt })
+                } else {
+                    serde_json::Value::Object(Default::default())
+                };
+
+                let action = ProposedAction {
+                    name: entry.name.to_string(),
+                    args,
+                    write: entry.write,
+                    summary: summary.to_string(),
+                };
+
+                let text_msg = if lang == "es" {
+                    summary.to_string()
+                } else {
+                    summary.to_string()
+                };
+
+                return Some(FallbackResponse::action(action, text_msg));
+            }
+        }
+
+        None
+    }
+
+    /// Map compile FSM slots (collected during a guided flow) into a `ProposedAction`.
+    /// Called at the end of the compile FSM so the caller can return an action
+    /// instead of (or in addition to) instruction text.
+    pub fn compile_slots_to_action(fmt: &str, _scope: &str) -> ProposedAction {
+        ProposedAction {
+            name: "open_compile_panel".to_string(),
+            args: serde_json::json!({ "format": fmt.to_uppercase() }),
+            write: false,
+            summary: format!("Open compile panel ({})", fmt.to_uppercase()),
+        }
     }
 }
 
@@ -430,5 +501,80 @@ mod tests {
         assert!(result.is_some());
         let (flow, _) = result.unwrap();
         assert_eq!(flow, FsmFlow::Compile);
+    }
+
+    // ── Action detection tests ────────────────────────────────────────────────
+
+    #[test]
+    fn detect_action_word_count() {
+        let engine = FallbackEngine::new();
+        let resp = engine.detect_action("count my words", "en").unwrap();
+        let action = resp.action.unwrap();
+        assert_eq!(action.name, "word_count");
+        assert!(!action.write);
+    }
+
+    #[test]
+    fn detect_action_word_count_es() {
+        let engine = FallbackEngine::new();
+        let resp = engine.detect_action("cuántas palabras tengo", "es").unwrap();
+        let action = resp.action.unwrap();
+        assert_eq!(action.name, "word_count");
+    }
+
+    #[test]
+    fn detect_action_snapshot() {
+        let engine = FallbackEngine::new();
+        let resp = engine.detect_action("create a snapshot", "en").unwrap();
+        let action = resp.action.unwrap();
+        assert_eq!(action.name, "create_snapshot");
+        assert!(action.write);
+    }
+
+    #[test]
+    fn detect_action_compile_panel() {
+        let engine = FallbackEngine::new();
+        let resp = engine.detect_action("compile to PDF", "en").unwrap();
+        let action = resp.action.unwrap();
+        assert_eq!(action.name, "open_compile_panel");
+        assert!(!action.write); // navigation, not headless export
+        let fmt = action.args.get("format").and_then(|v| v.as_str());
+        assert_eq!(fmt, Some("PDF"));
+    }
+
+    #[test]
+    fn detect_action_stats_panel() {
+        let engine = FallbackEngine::new();
+        let resp = engine.detect_action("show statistics", "en").unwrap();
+        let action = resp.action.unwrap();
+        assert_eq!(action.name, "open_statistics_panel");
+    }
+
+    #[test]
+    fn no_action_for_plain_question() {
+        let engine = FallbackEngine::new();
+        let resp = engine.detect_action("how do I change the font?", "en");
+        assert!(resp.is_none());
+    }
+
+    #[test]
+    fn no_action_for_word_in_plain_sentence() {
+        // "word" alone (as in "I want to change my word choice") must NOT trigger compile.
+        let engine = FallbackEngine::new();
+        let resp = engine.detect_action("I want to improve my word choice", "en");
+        // Should either be None or at most word_count — never open_compile_panel.
+        if let Some(r) = resp {
+            let name = r.action.unwrap().name;
+            assert_ne!(name, "open_compile_panel",
+                "plain 'word' must not trigger compile");
+        }
+    }
+
+    #[test]
+    fn detect_action_word_count_phrase() {
+        // "how many words" is a specific enough phrase.
+        let engine = FallbackEngine::new();
+        let resp = engine.detect_action("how many words do I have so far", "en").unwrap();
+        assert_eq!(resp.action.unwrap().name, "word_count");
     }
 }

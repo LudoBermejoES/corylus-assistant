@@ -12,9 +12,12 @@ mod state;
 mod backend;
 mod ollama;
 mod provision;
+pub mod actions;
 pub mod catalog;
 pub mod rag;
 pub mod index;
+pub mod fallback;
+pub mod router;
 
 #[cfg(test)]
 mod tests;
@@ -25,6 +28,9 @@ pub use backend::{AssistantBackend, ChatMessage, ChatToken, RamTier, RetrievedCh
 pub use ollama::OllamaBackend;
 pub use index::{VectorIndex, RetrievedRow};
 pub use catalog::{ModelEntry, CATALOG};
+pub use fallback::{FallbackEngine, FsmState, FsmFlow};
+pub use router::{Router, RouterResponse, is_llm_ready};
+pub use actions::{ProposedAction, ACTION_CATALOG, find_action};
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
