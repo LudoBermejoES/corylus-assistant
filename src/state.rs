@@ -22,6 +22,9 @@ pub enum AssistantState {
     Error { message: String },
 }
 
+// Part of the crate's public path-helper API; not used by the current
+// embedder but kept for external consumers / symmetry with version_path.
+#[allow(dead_code)]
 pub fn assistant_dir(config: &EngineConfig) -> PathBuf {
     config.data_dir.clone()
 }
@@ -30,6 +33,8 @@ pub fn version_path(config: &EngineConfig) -> PathBuf {
     config.data_dir.join("assistant.version.json")
 }
 
+// Public path-helper API; unused by the current embedder.
+#[allow(dead_code)]
 pub fn part_path(config: &EngineConfig) -> PathBuf {
     config.data_dir.join("model.part")
 }

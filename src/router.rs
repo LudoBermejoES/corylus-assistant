@@ -9,7 +9,7 @@
 use std::time::Duration;
 
 use crate::actions::{ProposedAction, ACTION_CATALOG};
-use crate::fallback::{detect_lang, FallbackEngine, FallbackResponse, FsmFlow, FsmState};
+use crate::fallback::{detect_lang, FallbackEngine, FallbackResponse, FsmState};
 use crate::AssistantEngine;
 
 /// Check whether the configured chat model is reachable and present.

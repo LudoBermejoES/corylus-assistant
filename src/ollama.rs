@@ -38,12 +38,18 @@ const OLLAMA_VERSION: &str = "v0.30.10-1";
 
 // SHA-256 of the repacked zips produced by scripts/prepare_ollama.py.
 // Update these (and OLLAMA_VERSION above) whenever the script is re-run.
+// Each constant is cfg-gated to the platform that consumes it in
+// `platform_asset()`, so only the relevant one is compiled per target.
+#[cfg(target_os = "macos")]
 const OLLAMA_SHA256_MACOS_UNIVERSAL: &str =
     "11f889a1ab3c4b3f91561a3b54b2438a30029c271aa07da22e6f38e511fe4781";
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 const OLLAMA_SHA256_LINUX_X86_64: &str =
     "d6109b0be28b4b285ca49b435c82941f6d04cdfaadc08fa512e40a03668bb10a";
+#[cfg(all(target_os = "linux", target_arch = "aarch64"))]
 const OLLAMA_SHA256_LINUX_AARCH64: &str =
     "8602ed350edf273d07e357aa60c328d5b6d4a79111bb1949987aa9f2bf738489";
+#[cfg(all(target_os = "windows", target_arch = "x86_64"))]
 const OLLAMA_SHA256_WINDOWS_X86_64: &str =
     "a037da7ff3f49f7dfc2431a42686b3027a75ecb3e6684276e6b9f15938fb37cd";
 

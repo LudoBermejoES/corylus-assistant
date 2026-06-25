@@ -4,7 +4,7 @@
 //! writes the version sentinel when the model is confirmed ready.
 
 use std::sync::{Arc, Mutex};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::AtomicBool;
 use tracing::info;
 
 use crate::{
@@ -12,7 +12,6 @@ use crate::{
     backend::AssistantBackend,
     ollama::OllamaBackend,
     state::{VersionFile, SCHEMA_VERSION, version_path},
-    error::AssistantError,
 };
 
 /// Run the full provision sequence: Ollama install (if needed + consented) → model pull.
