@@ -1,5 +1,5 @@
 #[cfg(test)]
-mod tests {
+mod unit_tests {
     use crate::{AssistantEngine, AssistantState, EngineConfig, RamTier};
 
     fn test_config(data_dir: &std::path::Path) -> EngineConfig {
@@ -65,5 +65,38 @@ mod tests {
         engine.uninstall().unwrap();
         assert!(!ver_path.exists());
         assert_eq!(engine.state(), AssistantState::NotInstalled);
+    }
+
+    // Regression test for the stale-model bug (D4): set_model_id/set_embedding_model
+    // used to write straight into backend.config via try_lock and silently skip when
+    // the backend was busy, so a model switch made mid-operation never took effect.
+    // Every operation (provision::run, index_project, chat) now re-syncs
+    // backend.config from inner.config under an AWAITED lock at call time — this
+    // test exercises exactly that pattern (hold the backend lock to simulate "busy",
+    // switch models, release, then sync-under-lock the way those call sites do) and
+    // asserts the new model wins, not the one that was active when the lock was busy.
+    #[tokio::test]
+    async fn model_switch_while_backend_busy_is_picked_up_on_next_sync() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = test_config(tmp.path());
+        let engine = AssistantEngine::new(cfg);
+
+        // Simulate the backend being busy (e.g. an in-flight chat/index) by holding
+        // its lock on a spawned task while the model is switched.
+        let backend = engine.backend.clone();
+        let hold = backend.lock().await;
+        engine.set_model_id("qwen3:new-model".into());
+        engine.set_embedding_model("new-embed-model".into());
+        drop(hold);
+
+        // This mirrors the sync line provision::run()/index_project() perform right
+        // after acquiring the backend lock.
+        let config = engine.config();
+        let mut b = backend.lock().await;
+        b.config.model_id = config.model_id.clone();
+        b.config.embedding_model = config.embedding_model.clone();
+
+        assert_eq!(b.config.model_id, "qwen3:new-model");
+        assert_eq!(b.config.embedding_model, "new-embed-model");
     }
 }

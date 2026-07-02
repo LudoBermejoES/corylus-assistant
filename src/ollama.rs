@@ -254,7 +254,7 @@ impl OllamaBackend {
                         .map(|n| {
                             n == model_id
                                 || (!model_id.contains(':')
-                                    && n == &format!("{}:latest", model_id))
+                                    && n == format!("{}:latest", model_id))
                         })
                         .unwrap_or(false)
                 })

@@ -129,7 +129,7 @@ impl VectorIndex {
         &mut self,
         documents: Vec<(String, String)>,
         config: &EngineConfig,
-        embed_fn: &(impl AsyncEmbedFn + Sync),
+        embed_fn: &impl AsyncEmbedFn,
         on_progress: impl Fn(usize, usize),
     ) -> Result<()> {
         self.reset()?;
@@ -141,7 +141,7 @@ impl VectorIndex {
         &mut self,
         documents: Vec<(String, String)>,
         config: &EngineConfig,
-        embed_fn: &(impl AsyncEmbedFn + Sync),
+        embed_fn: &impl AsyncEmbedFn,
         on_progress: impl Fn(usize, usize),
     ) -> Result<()> {
         let total = documents.len();
@@ -322,7 +322,7 @@ fn f32_slice_to_blob(v: &[f32]) -> Vec<u8> {
 }
 
 fn blob_to_f32_slice(blob: &[u8]) -> Vec<f32> {
-    if blob.len() % 4 != 0 { return vec![]; }
+    if !blob.len().is_multiple_of(4) { return vec![]; }
     blob.chunks_exact(4)
         .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
         .collect()

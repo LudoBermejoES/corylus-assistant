@@ -134,25 +134,17 @@ impl AssistantEngine {
         self.inner.lock().unwrap().config.clone()
     }
 
-    /// Override the chat model ID. Takes effect on the next chat/provision call.
+    /// Override the chat model ID. `inner.config` is the single source of truth;
+    /// every operation (chat/provision/index_project) syncs the backend's config
+    /// from it under the backend lock at call time, so there is no race with the
+    /// backend being busy at selection time.
     pub fn set_model_id(&self, model_id: String) {
-        let mut g = self.inner.lock().unwrap();
-        g.config.model_id = model_id.clone();
-        if let Ok(mut b) = self.backend.try_lock() {
-            b.config.model_id = model_id;
-        }
-        // If try_lock failed (backend busy), the backend config is synced from inner.config
-        // at the start of every chat() and provision() call.
+        self.inner.lock().unwrap().config.model_id = model_id;
     }
 
-    /// Override the embedding model ID. Takes effect on the next index/embed call.
+    /// Override the embedding model ID. See `set_model_id` — same single-source-of-truth pattern.
     pub fn set_embedding_model(&self, embedding_model: String) {
-        let mut g = self.inner.lock().unwrap();
-        g.config.embedding_model = embedding_model.clone();
-        if let Ok(mut b) = self.backend.try_lock() {
-            b.config.embedding_model = embedding_model;
-        }
-        // If try_lock failed, the backend config is synced from inner.config at call time.
+        self.inner.lock().unwrap().config.embedding_model = embedding_model;
     }
 
     /// Begin provisioning (install Ollama + pull model). Consent must be given before calling.
@@ -164,14 +156,16 @@ impl AssistantEngine {
         provision::run(self.inner.clone(), self.backend.clone(), self.cancel_pull.clone(), on_progress).await
     }
 
-    /// Detect available system RAM (best-effort).
-    pub fn detect_ram_bytes(&self) -> Option<u64> {
-        self.backend.try_lock().ok().as_mut().map(|b| b.detect_ram_bytes()).flatten()
+    /// Detect available system RAM (best-effort). Awaits the backend lock rather
+    /// than `try_lock`-and-degrade, so a concurrent operation holding the lock
+    /// delays this call instead of causing it to silently report no RAM detected.
+    pub async fn detect_ram_bytes(&self) -> Option<u64> {
+        self.backend.lock().await.detect_ram_bytes()
     }
 
     /// Return the RAM-aware default model tag and its approximate size/RAM.
-    pub fn model_info(&self) -> ModelInfo {
-        let ram = self.detect_ram_bytes();
+    pub async fn model_info(&self) -> ModelInfo {
+        let ram = self.detect_ram_bytes().await;
         let tier = RamTier::from_bytes(ram);
         ModelInfo {
             model_id: tier.default_model().into(),
@@ -229,6 +223,11 @@ impl AssistantEngine {
         tracing::info!("[assistant] index_project: ensuring server running before embedding");
         {
             let mut b = self.backend.lock().await;
+            // Sync embedding_model from inner.config into the backend at call time —
+            // the same pattern chat() uses for model_id — so a model switch made via
+            // set_embedding_model() while the backend was busy (try_lock failed) still
+            // takes effect here rather than silently indexing with the previous model.
+            b.config.embedding_model = config.embedding_model.clone();
             b.ensure_server_running().await?;
             // Pull the embedding model if not yet present (e.g. existing installs that
             // predate the auto-pull logic, or first index after a fresh chat-model install).
@@ -261,7 +260,7 @@ impl AssistantEngine {
     pub fn chunk_count(&self) -> Result<usize> {
         let config = self.config();
         let idx = index::VectorIndex::open(&config)?;
-        Ok(idx.chunk_count()?)
+        idx.chunk_count()
     }
 
     /// Send a chat message grounded in the RAG index and return the full response text.

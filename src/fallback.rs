@@ -67,6 +67,12 @@ pub struct FallbackEngine {
     entries: Vec<CorpusEntry>,
 }
 
+impl Default for FallbackEngine {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl FallbackEngine {
     pub fn new() -> Self {
         let entries: Vec<CorpusEntry> =
@@ -330,13 +336,10 @@ impl FallbackEngine {
                     summary: summary.to_string(),
                 };
 
-                let text_msg = if lang == "es" {
-                    summary.to_string()
-                } else {
-                    summary.to_string()
-                };
-
-                return Some(FallbackResponse::action(action, text_msg));
+                // `summary` is already the language-correct string (selected above
+                // from `entry.summary`/`entry.summary_es`), so no further branch on
+                // `lang` is needed here.
+                return Some(FallbackResponse::action(action, summary.to_string()));
             }
         }
 
@@ -520,6 +523,25 @@ mod tests {
         let resp = engine.detect_action("cuántas palabras tengo", "es").unwrap();
         let action = resp.action.unwrap();
         assert_eq!(action.name, "word_count");
+    }
+
+    // Regression test: `detect_action`'s response text used to be built with a
+    // dead `if lang == "es" { summary } else { summary }` branch (both arms
+    // identical — the language selection had already happened earlier when
+    // `summary` was picked from `entry.summary`/`entry.summary_es`). Assert the
+    // returned text is still correctly localized in both languages after
+    // simplifying that to a direct `summary.to_string()`.
+    #[test]
+    fn detect_action_response_text_is_localized_per_language() {
+        let engine = FallbackEngine::new();
+        let resp_en = engine.detect_action("count my words", "en").unwrap();
+        let resp_es = engine.detect_action("cuántas palabras tengo", "es").unwrap();
+        assert!(!resp_en.text.is_empty());
+        assert!(!resp_es.text.is_empty());
+        assert_ne!(resp_en.text, resp_es.text, "en/es action summaries should differ");
+        // The response text must match the action's own summary field.
+        assert_eq!(resp_en.text, resp_en.action.as_ref().unwrap().summary);
+        assert_eq!(resp_es.text, resp_es.action.as_ref().unwrap().summary);
     }
 
     #[test]

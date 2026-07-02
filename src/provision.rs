@@ -41,6 +41,13 @@ pub async fn run(
     let inner2 = inner.clone();
     {
         let mut b = backend.lock().await;
+        // Sync model_id/embedding_model from inner.config into the backend at call
+        // time — the same pattern chat() uses — so a model switch made via
+        // set_model_id()/set_embedding_model() while the backend was busy (try_lock
+        // failed) still takes effect for this pull rather than silently provisioning
+        // the previous model.
+        b.config.model_id = config.model_id.clone();
+        b.config.embedding_model = config.embedding_model.clone();
         b.set_cancel(cancel);
         b.ensure_ready(move |s| {
             inner2.lock().unwrap().state = s.clone();
