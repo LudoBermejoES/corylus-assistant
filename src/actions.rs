@@ -100,6 +100,74 @@ pub static ACTION_CATALOG: &[ActionEntry] = &[
         summary: "Open the statistics panel",
         summary_es: "Abrir el panel de estadísticas",
     },
+    ActionEntry {
+        name: "ambient_sounds_play",
+        description: "Resume the current ambient-sounds mix",
+        description_es: "Reanudar la mezcla de sonidos ambientales actual",
+        write: true,
+        // Require a qualifier alongside "play"/"reproduce" so this doesn't steal
+        // turns from unrelated "play"-adjacent chat.
+        intent_signals: &[
+            "play sounds", "play ambient", "play the ambient sounds", "play my sounds",
+            "play my mix", "resume sounds", "resume ambient sounds", "play the rain",
+            "reproduce sonido", "reproducir sonido", "pon la lluvia", "reanudar sonidos",
+            "reproducir mezcla", "reproduce mi mezcla",
+        ],
+        summary: "Play the current ambient-sounds mix",
+        summary_es: "Reproducir la mezcla de sonidos ambientales actual",
+    },
+    ActionEntry {
+        name: "ambient_sounds_stop",
+        description: "Pause the current ambient-sounds mix",
+        description_es: "Pausar la mezcla de sonidos ambientales actual",
+        write: true,
+        intent_signals: &[
+            "stop sounds", "stop ambient", "stop the ambient sounds", "stop my sounds",
+            "pause sounds", "pause ambient sounds", "stop the rain", "pause my mix",
+            "para el sonido", "parar sonido", "detener sonido", "pausar sonido",
+            "pausar mezcla", "detener mezcla",
+        ],
+        summary: "Stop the current ambient-sounds mix",
+        summary_es: "Detener la mezcla de sonidos ambientales actual",
+    },
+    ActionEntry {
+        name: "open_ambient_mixer",
+        description: "Open the ambient-sounds mixer dialog",
+        description_es: "Abrir el mezclador de sonidos ambientales",
+        write: false,
+        intent_signals: &[
+            "open the mixer", "open sound mixer", "open ambient sounds", "sound mixer",
+            "abrir mezclador", "abrir sonidos ambientales", "abrir el mezclador de sonido",
+        ],
+        summary: "Open the ambient-sounds mixer",
+        summary_es: "Abrir el mezclador de sonidos ambientales",
+    },
+    ActionEntry {
+        name: "toggle_distraction_free",
+        description: "Enter or exit distraction-free writing mode",
+        description_es: "Entrar o salir del modo de escritura sin distracciones",
+        write: true,
+        intent_signals: &[
+            "distraction free", "distraction-free", "focus mode", "go distraction free",
+            "enter distraction free", "exit distraction free", "modo sin distracciones",
+            "pantalla completa de escritura", "modo enfoque", "escritura sin distracciones",
+        ],
+        summary: "Toggle distraction-free mode",
+        summary_es: "Alternar el modo sin distracciones",
+    },
+    ActionEntry {
+        name: "open_settings",
+        description: "Open the Settings screen, optionally at a named category",
+        description_es: "Abrir la pantalla de Ajustes, opcionalmente en una categoría concreta",
+        write: false,
+        intent_signals: &[
+            "open settings", "show settings", "open preferences", "abrir ajustes",
+            "abrir configuración", "abrir preferencias", "mostrar ajustes",
+            "ambient sound settings", "ajustes de sonido",
+        ],
+        summary: "Open Settings",
+        summary_es: "Abrir Ajustes",
+    },
 ];
 
 /// Look up an entry by name.

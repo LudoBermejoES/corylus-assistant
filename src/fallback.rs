@@ -317,6 +317,21 @@ impl FallbackEngine {
             None
         }
 
+        // Extract an optional settings-category hint from the message.
+        // Maps obvious phrasings to the same category ids `ui.openSettingsCategory` uses.
+        fn extract_settings_category(lower: &str) -> Option<String> {
+            const MAPPINGS: &[(&[&str], &str)] = &[
+                (&["ambient sound", "sonido ambiental", "sonidos ambientales"], "ambientSounds"),
+                (&["appearance", "apariencia", "theme", "tema"], "appearance"),
+            ];
+            for (keywords, category) in MAPPINGS {
+                if keywords.iter().any(|kw| lower.contains(kw)) {
+                    return Some((*category).to_string());
+                }
+            }
+            None
+        }
+
         for entry in ACTION_CATALOG {
             if entry.intent_signals.iter().any(|sig| lower.contains(sig)) {
                 let summary = if lang == "es" { entry.summary_es } else { entry.summary };
@@ -325,6 +340,9 @@ impl FallbackEngine {
                 let args = if entry.name == "open_compile_panel" {
                     let fmt = extract_format(&lower);
                     serde_json::json!({ "format": fmt })
+                } else if entry.name == "open_settings" {
+                    let category = extract_settings_category(&lower);
+                    serde_json::json!({ "category": category })
                 } else {
                     serde_json::Value::Object(Default::default())
                 };
@@ -598,5 +616,122 @@ mod tests {
         let engine = FallbackEngine::new();
         let resp = engine.detect_action("how many words do I have so far", "en").unwrap();
         assert_eq!(resp.action.unwrap().name, "word_count");
+    }
+
+    // ── v2 action detection tests ─────────────────────────────────────────────
+
+    #[test]
+    fn detect_action_ambient_play() {
+        let engine = FallbackEngine::new();
+        let resp = engine.detect_action("play my sounds", "en").unwrap();
+        let action = resp.action.unwrap();
+        assert_eq!(action.name, "ambient_sounds_play");
+        assert!(action.write);
+    }
+
+    #[test]
+    fn detect_action_ambient_play_es() {
+        let engine = FallbackEngine::new();
+        let resp = engine.detect_action("pon la lluvia", "es").unwrap();
+        assert_eq!(resp.action.unwrap().name, "ambient_sounds_play");
+    }
+
+    #[test]
+    fn detect_action_ambient_stop() {
+        let engine = FallbackEngine::new();
+        let resp = engine.detect_action("stop the ambient sounds", "en").unwrap();
+        let action = resp.action.unwrap();
+        assert_eq!(action.name, "ambient_sounds_stop");
+        assert!(action.write);
+    }
+
+    #[test]
+    fn detect_action_ambient_stop_es() {
+        let engine = FallbackEngine::new();
+        let resp = engine.detect_action("para el sonido", "es").unwrap();
+        assert_eq!(resp.action.unwrap().name, "ambient_sounds_stop");
+    }
+
+    #[test]
+    fn detect_action_open_ambient_mixer() {
+        let engine = FallbackEngine::new();
+        let resp = engine.detect_action("open the mixer", "en").unwrap();
+        let action = resp.action.unwrap();
+        assert_eq!(action.name, "open_ambient_mixer");
+        assert!(!action.write);
+    }
+
+    #[test]
+    fn detect_action_toggle_distraction_free() {
+        let engine = FallbackEngine::new();
+        let resp = engine.detect_action("go distraction free", "en").unwrap();
+        let action = resp.action.unwrap();
+        assert_eq!(action.name, "toggle_distraction_free");
+        assert!(action.write);
+    }
+
+    #[test]
+    fn detect_action_toggle_distraction_free_es() {
+        let engine = FallbackEngine::new();
+        let resp = engine.detect_action("modo sin distracciones", "es").unwrap();
+        assert_eq!(resp.action.unwrap().name, "toggle_distraction_free");
+    }
+
+    #[test]
+    fn detect_action_open_settings() {
+        let engine = FallbackEngine::new();
+        let resp = engine.detect_action("open settings", "en").unwrap();
+        let action = resp.action.unwrap();
+        assert_eq!(action.name, "open_settings");
+        assert!(!action.write);
+        assert_eq!(action.args.get("category").and_then(|v| v.as_str()), None);
+    }
+
+    #[test]
+    fn detect_action_open_settings_with_category() {
+        let engine = FallbackEngine::new();
+        let resp = engine.detect_action("open ambient sound settings", "en").unwrap();
+        let action = resp.action.unwrap();
+        assert_eq!(action.name, "open_settings");
+        assert_eq!(
+            action.args.get("category").and_then(|v| v.as_str()),
+            Some("ambientSounds")
+        );
+    }
+
+    #[test]
+    fn no_action_collision_bare_play_open_stop() {
+        // Bare "play"/"open"/"stop" must not accidentally resolve to the new
+        // qualifier-required actions.
+        let engine = FallbackEngine::new();
+        assert!(engine.detect_action("I want to play with my characters", "en").is_none());
+        assert!(engine.detect_action("stop being so hard on yourself", "en").is_none());
+        // "open" alone is too broad — only qualified phrases like "open settings"/
+        // "open the mixer"/"open compile" should match; a generic sentence with
+        // "open" must not resolve to an action.
+        let resp = engine.detect_action("I left the door open", "en");
+        assert!(resp.is_none());
+    }
+
+    #[test]
+    fn existing_actions_unaffected_by_new_catalog_entries() {
+        // Regression guard: adding the v2 actions must not steal turns from v1.
+        let engine = FallbackEngine::new();
+        assert_eq!(
+            engine.detect_action("count my words", "en").unwrap().action.unwrap().name,
+            "word_count"
+        );
+        assert_eq!(
+            engine.detect_action("create a snapshot", "en").unwrap().action.unwrap().name,
+            "create_snapshot"
+        );
+        assert_eq!(
+            engine.detect_action("compile to PDF", "en").unwrap().action.unwrap().name,
+            "open_compile_panel"
+        );
+        assert_eq!(
+            engine.detect_action("show statistics", "en").unwrap().action.unwrap().name,
+            "open_statistics_panel"
+        );
     }
 }

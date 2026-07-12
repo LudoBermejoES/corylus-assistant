@@ -97,6 +97,13 @@ async fn try_tool_call(message: &str, engine: &AssistantEngine) -> Option<Propos
                                 "enum": ["PDF", "EPUB", "DOCX"]
                             }
                         })
+                    } else if e.name == "open_settings" {
+                        serde_json::json!({
+                            "category": {
+                                "type": "string",
+                                "description": "Settings category to open directly, e.g. appearance or ambientSounds"
+                            }
+                        })
                     } else {
                         serde_json::json!({})
                     },
