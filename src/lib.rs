@@ -12,6 +12,7 @@ mod state;
 mod backend;
 mod ollama;
 mod provision;
+pub mod gpu;
 pub mod actions;
 pub mod catalog;
 pub mod rag;
@@ -30,6 +31,7 @@ pub use index::{VectorIndex, RetrievedRow};
 pub use catalog::{ModelEntry, CATALOG};
 pub use fallback::{FallbackEngine, FsmState, FsmFlow};
 pub use router::{Router, RouterResponse, is_llm_ready};
+pub use gpu::{Backend as GpuBackend, GpuStatus};
 pub use actions::{ProposedAction, ACTION_CATALOG, find_action};
 
 use std::path::PathBuf;
@@ -81,6 +83,8 @@ pub struct AssistantEngine {
     inner: Arc<Mutex<Inner>>,
     backend: Arc<tokio::sync::Mutex<OllamaBackend>>,
     cancel_pull: Arc<AtomicBool>,
+    /// True while a GPU add-on install or backend switch runs.
+    gpu_busy: Arc<AtomicBool>,
 }
 
 impl AssistantEngine {
@@ -93,6 +97,7 @@ impl AssistantEngine {
             })),
             backend: Arc::new(tokio::sync::Mutex::new(backend)),
             cancel_pull: Arc::new(AtomicBool::new(false)),
+            gpu_busy: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -120,6 +125,139 @@ impl AssistantEngine {
         if state::is_ready(&g.config) {
             g.state = AssistantState::Ready;
         }
+    }
+
+    /// Where `ollama-server.log` goes (the app log dir). Called from app setup.
+    pub fn set_log_dir(&self, log_dir: PathBuf) {
+        if let Ok(mut b) = self.backend.try_lock() {
+            b.log_dir = Some(log_dir);
+        }
+    }
+
+    // ── GPU acceleration (see gpu.rs) ──────────────────────────────────────────
+
+    /// Approximate size of the configured chat model, to judge whether a card fits it.
+    fn chat_model_bytes(&self) -> u64 {
+        let id = self.config().model_id;
+        CATALOG
+            .iter()
+            .find(|e| e.id == id)
+            .map(|e| (e.size_gb as f64 * 1e9) as u64)
+            .unwrap_or_else(|| RamTier::from_bytes(detect_system_ram()).default_model_size_bytes())
+    }
+
+    /// True when Corylus installed Ollama itself (only then may it add GPU support).
+    fn managed_install_present(&self) -> bool {
+        let bin = if cfg!(target_os = "windows") { "ollama.exe" } else { "ollama" };
+        self.data_dir().join("bin").join(bin).exists()
+    }
+
+    /// The graphics card, the backend in use and the add-on that would help.
+    pub fn gpu_status(&self) -> GpuStatus {
+        let data_dir = self.data_dir();
+        gpu::status(
+            self.managed_install_present(),
+            &gpu::detect_adapters(),
+            self.chat_model_bytes(),
+            gpu::load_state(&data_dir).as_ref(),
+        )
+    }
+
+    /// Download (with consent, given in the UI) and install the recommended GPU
+    /// add-on, then restart the server on it and verify. `on_progress` gets
+    /// (downloaded, total) bytes. Cancel with `cancel_pull()`.
+    pub async fn gpu_install(&self, on_progress: impl Fn(u64, u64) + Send + Sync) -> Result<GpuStatus> {
+        if self.gpu_busy.swap(true, Ordering::SeqCst) {
+            return Err(AssistantError::Internal("graphics support is already being set up".into()));
+        }
+        let result = self.gpu_install_inner(on_progress).await;
+        self.gpu_busy.store(false, Ordering::SeqCst);
+        result
+    }
+
+    async fn gpu_install_inner(&self, on_progress: impl Fn(u64, u64) + Send + Sync) -> Result<GpuStatus> {
+        let status = self.gpu_status();
+        if !status.supported {
+            return Err(AssistantError::OllamaInstallFailed(
+                "graphics support needs the assistant installed by Corylus on Windows".into(),
+            ));
+        }
+        let backend = status.recommended;
+        let addon = gpu::addon(backend).ok_or_else(|| {
+            AssistantError::OllamaInstallFailed("no usable graphics card for the assistant".into())
+        })?;
+        let data_dir = self.data_dir();
+        let installed = gpu::load_state(&data_dir).is_some_and(|s| s.installed.contains(&backend));
+
+        // Download without the backend lock, so chat keeps working meanwhile.
+        self.cancel_pull.store(false, Ordering::Relaxed);
+        let part = if installed {
+            None
+        } else {
+            Some(gpu::download_addon(addon, &data_dir, &self.cancel_pull, on_progress).await?)
+        };
+
+        let mut b = self.backend.lock().await;
+        b.engine_managed_install = true;
+        if let Some(part) = part {
+            b.stop_managed_server().await;
+            let bin_dir = data_dir.join("bin");
+            let zip = part.clone();
+            let res = tokio::task::spawn_blocking(move || gpu::install_addon_zip(&zip, &bin_dir, backend))
+                .await
+                .map_err(|e| AssistantError::Internal(e.to_string()));
+            let _ = std::fs::remove_file(&part);
+            res??;
+        }
+        let mut state = gpu::load_state(&data_dir).unwrap_or_default();
+        if !state.installed.contains(&backend) {
+            state.installed.push(backend);
+        }
+        state.active = Some(backend);
+        state.cpu_only = false;
+        gpu::save_state(&data_dir, &state)?;
+        b.restart_and_verify().await?;
+        drop(b);
+        Ok(self.gpu_status())
+    }
+
+    /// Run on the processor (`true`) or go back to the installed graphics
+    /// support (`false`, which also forgets earlier failures and retries).
+    pub async fn gpu_set_cpu_only(&self, cpu_only: bool) -> Result<GpuStatus> {
+        if self.gpu_busy.swap(true, Ordering::SeqCst) {
+            return Err(AssistantError::Internal("graphics support is already being set up".into()));
+        }
+        let result = self.gpu_set_cpu_only_inner(cpu_only).await;
+        self.gpu_busy.store(false, Ordering::SeqCst);
+        result
+    }
+
+    async fn gpu_set_cpu_only_inner(&self, cpu_only: bool) -> Result<GpuStatus> {
+        let data_dir = self.data_dir();
+        let mut state = gpu::load_state(&data_dir)
+            .filter(|s| !s.installed.is_empty())
+            .ok_or_else(|| AssistantError::Internal("no graphics support installed".into()))?;
+        state.cpu_only = cpu_only;
+        if !cpu_only {
+            state.failed.clear();
+            let adapters = gpu::detect_adapters();
+            let best = gpu::best_adapter(&adapters, self.chat_model_bytes());
+            let wanted = gpu::choose(best, &[]);
+            state.active = Some(if state.installed.contains(&wanted) {
+                wanted
+            } else {
+                [gpu::Backend::Cuda, gpu::Backend::Vulkan]
+                    .into_iter()
+                    .find(|b| state.installed.contains(b))
+                    .unwrap_or(gpu::Backend::Cpu)
+            });
+        }
+        gpu::save_state(&data_dir, &state)?;
+        let mut b = self.backend.lock().await;
+        b.engine_managed_install = true;
+        b.restart_and_verify().await?;
+        drop(b);
+        Ok(self.gpu_status())
     }
 
     pub fn state(&self) -> AssistantState {

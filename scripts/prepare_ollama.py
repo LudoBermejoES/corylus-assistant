@@ -11,8 +11,18 @@ For each supported platform this script:
        Windows — ollama.exe + all *.dll files
   4. Repacks them into a minimal zip named
        ollama-{version}-{platform}-{arch}.zip
-  5. Prints the SHA-256 of each output zip so you can paste them into
-     ollama.rs.
+  5. On Windows, also builds one GPU add-on zip per backend
+       ollama-{version}-windows-x86_64-cuda.zip    (lib/ollama/cuda_v13/)
+       ollama-{version}-windows-x86_64-vulkan.zip  (lib/ollama/vulkan/)
+     whose entries keep the upstream lib/ollama/<backend>/ prefix, so they
+     extract next to ollama.exe in the layout Ollama searches. The base zip
+     is unchanged by this: CPU-only users never download an add-on.
+  6. Prints the SHA-256 and size of each output zip so you can paste them
+     into ollama.rs / gpu.rs.
+
+All zips are deterministic: entries sorted, fixed 1980-01-01 timestamps,
+deflate level 6, so a re-run on the same upstream archive gives the same
+SHA-256.
 
 Output files are written to  scripts/dist/  and are meant to be uploaded
 to a GitHub Release of the rust-assistant repo (or wherever asset_base_url
@@ -28,6 +38,10 @@ Usage
 
   # build only one platform (for CI on that OS)
   python3 scripts/prepare_ollama.py --platform macos
+
+  # keep the 1.4 GB upstream download and the output outside the repo
+  python3 scripts/prepare_ollama.py --version v0.30.10 --platform windows \
+      --cache-dir /tmp/ollama/upstream --dist-dir /tmp/ollama/dist
 
 Requirements: Python 3.9+, no extra packages (uses stdlib only).
 """
@@ -363,6 +377,36 @@ def _is_gpu_dll(name: str) -> bool:
     ))
 
 
+# ── GPU add-ons (Windows) ──────────────────────────────────────────────────────
+
+# add-on name -> upstream directory under lib/ollama/
+WINDOWS_ADDONS: dict[str, str] = {
+    "cuda": "cuda_v13",   # needs NVIDIA driver >= 580; cuda_v12 (887 MB) is not shipped
+    "vulkan": "vulkan",   # AMD, Intel, and NVIDIA with an older driver
+}
+
+
+def build_addon(src: Path, out_zip: Path, libdir: str) -> None:
+    """Copy lib/ollama/<libdir>/* from the upstream zip, prefix kept, sorted."""
+    print(f"  Building add-on {out_zip.name} …")
+    prefix = f"lib/ollama/{libdir}/"
+    with zipfile.ZipFile(src, "r") as src_zf:
+        entries = sorted(
+            (i for i in src_zf.infolist()
+             if not i.is_dir() and i.filename.replace("\\", "/").startswith(prefix)),
+            key=lambda i: i.filename,
+        )
+        if not entries:
+            sys.exit(f"  ERROR: no {prefix} entries in {src.name}")
+        with zipfile.ZipFile(out_zip, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=6) as zf:
+            for i in entries:
+                info = zipfile.ZipInfo(i.filename.replace("\\", "/"))  # 1980-01-01
+                info.external_attr = i.external_attr
+                info.compress_type = zipfile.ZIP_DEFLATED
+                zf.writestr(info, src_zf.read(i))
+    _report_zip(out_zip)
+
+
 # ── Helpers ────────────────────────────────────────────────────────────────────
 
 def _report_zip(path: Path) -> None:
@@ -391,13 +435,15 @@ def main() -> None:
     parser.add_argument("--version", metavar="TAG", help="Ollama version tag (e.g. v0.30.10); defaults to latest")
     parser.add_argument("--platform", choices=["macos", "linux", "windows"], help="Build only this platform")
     parser.add_argument("--keep-upstream", action="store_true", help="Keep downloaded upstream archives after repacking")
+    parser.add_argument("--cache-dir", type=Path, help="Where upstream archives are downloaded (default scripts/.cache)")
+    parser.add_argument("--dist-dir", type=Path, help="Where output zips are written (default scripts/dist)")
     args = parser.parse_args()
 
     script_dir = Path(__file__).parent
-    dist_dir = script_dir / "dist"
-    cache_dir = script_dir / ".cache"
-    dist_dir.mkdir(exist_ok=True)
-    cache_dir.mkdir(exist_ok=True)
+    dist_dir = args.dist_dir or script_dir / "dist"
+    cache_dir = args.cache_dir or script_dir / ".cache"
+    dist_dir.mkdir(parents=True, exist_ok=True)
+    cache_dir.mkdir(parents=True, exist_ok=True)
 
     print(f"Resolving Ollama release …")
     version, assets = resolve_version(args.version)
@@ -440,6 +486,22 @@ def main() -> None:
                 "size_bytes": out_path.stat().st_size,
             })
 
+            if platform == "windows":
+                for addon, libdir in WINDOWS_ADDONS.items():
+                    addon_name = f"ollama-{version}-{platform}-{arch}-{addon}.zip"
+                    addon_path = dist_dir / addon_name
+                    build_addon(cached, addon_path, libdir)
+                    addon_sha = sha256_file(addon_path)
+                    print(f"  Add-on  SHA256: {addon_sha}")
+                    results.append({
+                        "platform": platform,
+                        "arch": f"{arch}-{addon}",
+                        "version": version,
+                        "filename": addon_name,
+                        "sha256": addon_sha,
+                        "size_bytes": addon_path.stat().st_size,
+                    })
+
             if not args.keep_upstream:
                 # Remove from cache to save disk — keep if explicitly requested
                 pass  # cache is intentionally kept for reruns; dist/ is the deliverable
@@ -457,7 +519,7 @@ def main() -> None:
     print("// Asset SHA256s (update when re-running this script):")
     for r in results:
         const_name = f"OLLAMA_SHA256_{r['platform'].upper()}_{r['arch'].upper().replace('-', '_')}"
-        print(f'const {const_name}: &str = "{r["sha256"]}";')
+        print(f'const {const_name}: &str = "{r["sha256"]}";  // {r["filename"]}, {r["size_bytes"]} bytes')
     print()
     print("// Asset base URL (GitHub Release of the rust-assistant repo):")
     print('// const ASSET_BASE_URL: &str = "https://github.com/LudoBermejoES/corylus-assistant/releases/download/{version}";')

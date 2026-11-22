@@ -15,6 +15,10 @@
 //!
 //! If the user already has a system Ollama on PATH we reuse it as-is (no model
 //! relocation — they own that install).
+//!
+//! GPU support is a separate, consented add-on (see `gpu.rs`). The server's
+//! output goes to `ollama-server.log` in the app log dir, which is also where
+//! the backend Ollama picked (`inference compute … library=`) is read from.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -54,7 +58,7 @@ const OLLAMA_SHA256_WINDOWS_X86_64: &str =
     "a037da7ff3f49f7dfc2431a42686b3027a75ecb3e6684276e6b9f15938fb37cd";
 
 // Base URL for the vendored zips on the rust-assistant GitHub Release.
-const ASSET_BASE_URL: &str =
+pub(crate) const ASSET_BASE_URL: &str =
     "https://github.com/LudoBermejoES/corylus-assistant/releases/download";
 // GitHub Release tag for the asset zips (may differ from OLLAMA_VERSION when
 // we repack with fixes without bumping the upstream Ollama version).
@@ -66,6 +70,9 @@ const OLLAMA_BASE: &str = "http://127.0.0.1:11434";
 const HEALTH_TIMEOUT_SECS: u64 = 3;
 /// Name of the version marker file written after a successful private install.
 const VERSION_FILE: &str = "ollama-version.json";
+/// Server log in the app log dir, rotated to `.1` past this size at spawn.
+const SERVER_LOG: &str = "ollama-server.log";
+const SERVER_LOG_MAX_BYTES: u64 = 5 * 1024 * 1024;
 
 // ── OllamaBackend ──────────────────────────────────────────────────────────────
 
@@ -78,6 +85,12 @@ pub struct OllamaBackend {
     pub(crate) engine_managed_install: bool,
     /// Set to true by the engine to abort an in-progress pull after the current chunk.
     cancel: Arc<AtomicBool>,
+    /// App log dir for `ollama-server.log`; `<data_dir>/logs` until set.
+    pub(crate) log_dir: Option<PathBuf>,
+    /// The server we spawned this session, if any.
+    child: Option<tokio::process::Child>,
+    /// Log file and its length when the last server was spawned.
+    spawn_log: Option<(PathBuf, u64)>,
 }
 
 impl OllamaBackend {
@@ -92,6 +105,9 @@ impl OllamaBackend {
             client,
             engine_managed_install: false,
             cancel: Arc::new(AtomicBool::new(false)),
+            log_dir: None,
+            child: None,
+            spawn_log: None,
         }
     }
 
@@ -159,9 +175,20 @@ impl OllamaBackend {
 
         info!("[assistant] starting ollama serve from {}", bin_path.display());
         let mut cmd = tokio::process::Command::new(&bin_path);
-        cmd.arg("serve")
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null());
+        cmd.arg("serve");
+        match self.open_server_log() {
+            Ok((file, path, offset)) => {
+                cmd.stdout(file.try_clone().map(std::process::Stdio::from).unwrap_or_else(|_| std::process::Stdio::null()))
+                    .stderr(std::process::Stdio::from(file));
+                info!("[assistant] ollama server log: {}", path.display());
+                self.spawn_log = Some((path, offset));
+            }
+            Err(e) => {
+                warn!("[assistant] cannot open ollama server log: {}", e);
+                cmd.stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null());
+                self.spawn_log = None;
+            }
+        }
 
         if self.engine_managed_install {
             let models_dir = self.config.data_dir.join("models");
@@ -170,10 +197,19 @@ impl OllamaBackend {
             let bin_dir = self.config.data_dir.join("bin");
             prepend_path_env(&mut cmd, &bin_dir);
             info!("[assistant] OLLAMA_MODELS={}", models_dir.display());
+            // Only once GPU support was installed; otherwise Ollama picks as before.
+            if let Some(gpu) = crate::gpu::load_state(&self.config.data_dir) {
+                let lib = gpu.effective().llm_library();
+                cmd.env("OLLAMA_LLM_LIBRARY", lib);
+                info!("[assistant] OLLAMA_LLM_LIBRARY={}", lib);
+            }
         }
 
         match cmd.spawn() {
-            Ok(_) => info!("[assistant] ollama serve spawned"),
+            Ok(child) => {
+                info!("[assistant] ollama serve spawned");
+                self.child = Some(child);
+            }
             Err(e) => {
                 warn!("[assistant] failed to spawn ollama serve: {}", e);
                 return Err(AssistantError::OllamaServerDown);
@@ -190,6 +226,107 @@ impl OllamaBackend {
         }
         warn!("[assistant] ollama serve did not start in time after 8s");
         Err(AssistantError::OllamaServerDown)
+    }
+
+    /// Open `ollama-server.log` for appending, rotating it first when large.
+    /// Returns the file, its path and its length (where this run starts).
+    fn open_server_log(&self) -> std::io::Result<(std::fs::File, PathBuf, u64)> {
+        let dir = self.log_dir.clone().unwrap_or_else(|| self.config.data_dir.join("logs"));
+        std::fs::create_dir_all(&dir)?;
+        let path = dir.join(SERVER_LOG);
+        if std::fs::metadata(&path).map(|m| m.len() > SERVER_LOG_MAX_BYTES).unwrap_or(false) {
+            let _ = std::fs::rename(&path, dir.join(format!("{SERVER_LOG}.1")));
+        }
+        let file = std::fs::OpenOptions::new().create(true).append(true).open(&path)?;
+        let offset = file.metadata()?.len();
+        Ok((file, path, offset))
+    }
+
+    /// Stop the server Corylus started: the child from this session and any
+    /// process running from `<data_dir>/bin` (a server left by an earlier
+    /// session, and its runners). Never touches a system Ollama.
+    pub(crate) async fn stop_managed_server(&mut self) {
+        if !self.engine_managed_install {
+            return;
+        }
+        if let Some(mut child) = self.child.take() {
+            let _ = child.kill().await;
+        }
+        let bin_dir = self.config.data_dir.join("bin");
+        #[cfg(target_os = "windows")]
+        {
+            let prefix = format!("{}\\", bin_dir.display()).replace('\'', "''");
+            let script = format!(
+                "Get-Process | Where-Object {{ $_.Path -and $_.Path.StartsWith('{prefix}', [StringComparison]::OrdinalIgnoreCase) }} | Stop-Process -Force -ErrorAction SilentlyContinue"
+            );
+            let _ = tokio::process::Command::new("powershell.exe")
+                .args(["-NoProfile", "-NonInteractive", "-Command", &script])
+                .creation_flags(0x0800_0000) // CREATE_NO_WINDOW
+                .status()
+                .await;
+        }
+        #[cfg(target_os = "linux")]
+        if let Ok(procs) = std::fs::read_dir("/proc") {
+            for p in procs.flatten() {
+                let exe = std::fs::read_link(p.path().join("exe"));
+                if exe.is_ok_and(|e| e.starts_with(&bin_dir)) {
+                    let _ = std::process::Command::new("kill").arg("-9").arg(p.file_name()).status();
+                }
+            }
+        }
+        for _ in 0..20 {
+            if !self.server_alive().await {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+    }
+
+    /// `library=` values the last spawned server logged, waiting up to 20 s
+    /// for GPU discovery to finish.
+    async fn spawned_inference_libraries(&self) -> Vec<String> {
+        let Some((path, offset)) = self.spawn_log.clone() else { return Vec::new() };
+        for _ in 0..40 {
+            if let Ok(bytes) = std::fs::read(&path) {
+                let start = (offset as usize).min(bytes.len());
+                let libs = crate::gpu::inference_libraries(&String::from_utf8_lossy(&bytes[start..]));
+                if !libs.is_empty() {
+                    return libs;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+        Vec::new()
+    }
+
+    /// Restart the managed server with the backend in `gpu.json` and check the
+    /// log for it. On a mismatch, record why and fall back (CUDA → Vulkan if
+    /// installed → CPU) until something comes up.
+    pub(crate) async fn restart_and_verify(&mut self) -> Result<crate::gpu::GpuState> {
+        let data_dir = self.config.data_dir.clone();
+        let mut fell_back = false;
+        loop {
+            let mut state = crate::gpu::load_state(&data_dir).unwrap_or_default();
+            let wanted = state.effective();
+            self.stop_managed_server().await;
+            self.ensure_server_running().await?;
+            let observed = self.spawned_inference_libraries().await;
+            info!("[assistant] gpu: wanted {:?}, Ollama reported {:?}", wanted, observed);
+            if crate::gpu::libraries_include(&observed, wanted) {
+                if !fell_back {
+                    state.note = None; // keep the reason when this start is a fallback
+                }
+                crate::gpu::save_state(&data_dir, &state)?;
+                return Ok(state);
+            }
+            let next = state.record_failure(wanted, &observed);
+            warn!("[assistant] gpu: {}", state.note.as_deref().unwrap_or(""));
+            crate::gpu::save_state(&data_dir, &state)?;
+            if next.is_none() {
+                return Ok(state);
+            }
+            fell_back = true;
+        }
     }
 
     // ── Binary detection ───────────────────────────────────────────────────────
@@ -217,7 +354,7 @@ impl OllamaBackend {
         self.ollama_binary_path().is_some()
     }
 
-    fn private_install_present(&self) -> bool {
+    pub(crate) fn private_install_present(&self) -> bool {
         // Check the version marker so we know the install is complete, not partial.
         let marker = self.config.data_dir.join(VERSION_FILE);
         if !marker.exists() {
@@ -710,7 +847,7 @@ fn platform_asset() -> Result<(String, &'static str)> {
 /// Extract all entries from a zip into `dest_dir`, preserving subdirectory
 /// structure.  This is used both for platform zips (flat or with lib/ subdir)
 /// and any future layout.
-fn extract_zip(zip_path: &Path, dest_dir: &Path) -> Result<()> {
+pub(crate) fn extract_zip(zip_path: &Path, dest_dir: &Path) -> Result<()> {
     let file = std::fs::File::open(zip_path)
         .map_err(|e| AssistantError::OllamaInstallFailed(format!("open zip: {e}")))?;
     let mut archive = zip::ZipArchive::new(file)
