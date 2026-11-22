@@ -122,9 +122,53 @@ impl AssistantEngine {
                 b.engine_managed_install = ver.ollama_managed;
             }
         }
+        // An installed assistant is only "ready" once its server answers:
+        // `ensure_server`/`refresh_status` promote it to Ready after verifying.
         if state::is_ready(&g.config) {
-            g.state = AssistantState::Ready;
+            g.state = AssistantState::ServerDown;
         }
+    }
+
+    /// True when the assistant was installed (version sentinel matches the model).
+    pub fn is_installed(&self) -> bool {
+        state::is_ready(&self.config())
+    }
+
+    /// Make sure the Ollama server answers, starting it (with the selected GPU
+    /// backend) when it is down, and keep the state honest: Ready on success,
+    /// Error with the reason on failure. Only touches Ready/ServerDown/Error.
+    pub async fn ensure_server(&self) -> Result<()> {
+        let b = self.backend.lock().await;
+        self.start_locked(b).await
+    }
+
+    async fn start_locked(&self, mut b: tokio::sync::MutexGuard<'_, OllamaBackend>) -> Result<()> {
+        let res = b.ensure_server_running().await;
+        drop(b);
+        let installed = self.is_installed();
+        let mut g = self.inner.lock().unwrap();
+        if matches!(g.state, AssistantState::Ready | AssistantState::ServerDown | AssistantState::Error { .. }) {
+            match &res {
+                Ok(()) if installed => g.state = AssistantState::Ready,
+                Err(e) if installed => g.state = AssistantState::Error { message: e.to_string() },
+                _ => {}
+            }
+        }
+        res
+    }
+
+    /// Current state, verified: an installed assistant whose server is down is
+    /// started first. Skipped (current state returned) while another operation
+    /// such as a model pull holds the backend.
+    pub async fn refresh_status(&self) -> AssistantState {
+        if self.is_installed()
+            && matches!(self.state(), AssistantState::Ready | AssistantState::ServerDown | AssistantState::Error { .. })
+        {
+            if let Ok(b) = self.backend.try_lock() {
+                let _ = self.start_locked(b).await;
+            }
+        }
+        self.state()
     }
 
     /// Where `ollama-server.log` goes (the app log dir). Called from app setup.

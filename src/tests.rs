@@ -119,3 +119,114 @@ mod unit_tests {
         assert_eq!(b.config.embedding_model, "new-embed-model");
     }
 }
+
+#[cfg(test)]
+mod server_tests {
+    use crate::{AssistantEngine, AssistantState, EngineConfig, Router};
+    use std::time::Duration;
+
+    /// Minimal HTTP server answering 200 `{"models":[]}` to every request.
+    async fn fake_server() -> (String, tokio::task::JoinHandle<()>) {
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", l.local_addr().unwrap());
+        let h = tokio::spawn(async move {
+            loop {
+                let Ok((mut s, _)) = l.accept().await else { return };
+                tokio::spawn(async move {
+                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                    let mut buf = [0u8; 2048];
+                    let _ = s.read(&mut buf).await;
+                    let body = r#"{"models":[]}"#;
+                    let _ = s.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).await;
+                });
+            }
+        });
+        (url, h)
+    }
+
+    /// Installed assistant (version sentinel written) pointing at `endpoint`.
+    fn installed_engine(dir: &std::path::Path, endpoint: &str) -> AssistantEngine {
+        let cfg = EngineConfig {
+            data_dir: dir.to_path_buf(),
+            model_id: "qwen3:test".into(),
+            embedding_model: "nomic-embed-text".into(),
+            ollama_endpoint: endpoint.into(),
+            context_window: 4096,
+        };
+        std::fs::write(
+            dir.join("assistant.version.json"),
+            r#"{"model_id":"qwen3:test","schema_version":1,"ollama_managed":true}"#,
+        )
+        .unwrap();
+        let e = AssistantEngine::new(cfg);
+        e.set_data_dir(dir.to_path_buf());
+        e.backend.try_lock().unwrap().server_start_timeout = Duration::from_secs(2);
+        e
+    }
+
+    /// A port nothing listens on.
+    async fn dead_endpoint() -> String {
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        format!("http://{}", l.local_addr().unwrap())
+    }
+
+    #[tokio::test]
+    async fn restart_is_not_ready_until_server_verified() {
+        let tmp = tempfile::tempdir().unwrap();
+        let e = installed_engine(tmp.path(), &dead_endpoint().await);
+        assert_eq!(e.state(), AssistantState::ServerDown);
+    }
+
+    #[tokio::test]
+    async fn refresh_promotes_to_ready_when_server_answers() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (url, h) = fake_server().await;
+        let e = installed_engine(tmp.path(), &url);
+        assert_eq!(e.refresh_status().await, AssistantState::Ready);
+        h.abort();
+    }
+
+    #[tokio::test]
+    async fn failed_start_reports_error_not_ready() {
+        let tmp = tempfile::tempdir().unwrap();
+        // No ollama binary in <data_dir>/bin (and none on PATH in CI): start must fail.
+        let e = installed_engine(tmp.path(), &dead_endpoint().await);
+        assert!(e.ensure_server().await.is_err());
+        assert!(matches!(e.state(), AssistantState::Error { .. }));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn server_that_exits_at_once_fails_fast_with_reason() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let bin = tmp.path().join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let exe = bin.join("ollama");
+        std::fs::write(&exe, "#!/bin/sh\nexit 3\n").unwrap();
+        std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let e = installed_engine(tmp.path(), &dead_endpoint().await);
+        e.backend.try_lock().unwrap().server_start_timeout = Duration::from_secs(20);
+        let t = std::time::Instant::now();
+        let err = e.ensure_server().await.unwrap_err().to_string();
+        assert!(err.contains("exited"), "{err}");
+        assert!(t.elapsed() < Duration::from_secs(10));
+    }
+
+    #[tokio::test]
+    async fn chat_tags_basic_mode_when_server_cannot_start() {
+        let tmp = tempfile::tempdir().unwrap();
+        let e = installed_engine(tmp.path(), &dead_endpoint().await);
+        let r = Router::new().chat("hello", &mut None, &e).await;
+        assert_eq!(r.source, "llm_unavailable");
+    }
+
+    #[tokio::test]
+    async fn chat_without_install_stays_plain_fallback() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = EngineConfig::default_for_ram(tmp.path().to_path_buf(), None);
+        let e = AssistantEngine::new(cfg);
+        let r = Router::new().chat("hello", &mut None, &e).await;
+        assert_eq!(r.source, "fallback");
+    }
+}

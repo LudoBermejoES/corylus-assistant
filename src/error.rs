@@ -20,6 +20,9 @@ pub enum AssistantError {
     #[error("Ollama server is not running")]
     OllamaServerDown,
 
+    #[error("Ollama server did not start: {0}")]
+    OllamaServerStart(String),
+
     #[error("Ollama install failed: {0}")]
     OllamaInstallFailed(String),
 

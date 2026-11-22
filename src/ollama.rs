@@ -66,7 +66,6 @@ const ASSET_RELEASE_TAG: &str = "v0.30.10";
 
 // ── Misc constants ─────────────────────────────────────────────────────────────
 
-const OLLAMA_BASE: &str = "http://127.0.0.1:11434";
 const HEALTH_TIMEOUT_SECS: u64 = 3;
 /// Name of the version marker file written after a successful private install.
 const VERSION_FILE: &str = "ollama-version.json";
@@ -91,6 +90,8 @@ pub struct OllamaBackend {
     child: Option<tokio::process::Child>,
     /// Log file and its length when the last server was spawned.
     spawn_log: Option<(PathBuf, u64)>,
+    /// How long `ensure_server_running` waits for a freshly spawned server.
+    pub(crate) server_start_timeout: Duration,
 }
 
 impl OllamaBackend {
@@ -108,6 +109,7 @@ impl OllamaBackend {
             log_dir: None,
             child: None,
             spawn_log: None,
+            server_start_timeout: Duration::from_secs(30),
         }
     }
 
@@ -119,7 +121,7 @@ impl OllamaBackend {
 
     async fn server_alive(&self) -> bool {
         let alive = self.client
-            .get(format!("{}/api/tags", OLLAMA_BASE))
+            .get(format!("{}/api/tags", self.config.ollama_endpoint))
             .timeout(Duration::from_secs(HEALTH_TIMEOUT_SECS))
             .send()
             .await
@@ -138,7 +140,7 @@ impl OllamaBackend {
         info!("[assistant] embedding model {} not present, pulling now", embed_id);
         let resp = self
             .client
-            .post(format!("{}/api/pull", OLLAMA_BASE))
+            .post(format!("{}/api/pull", self.config.ollama_endpoint))
             .json(&serde_json::json!({ "name": embed_id, "stream": true }))
             .send()
             .await
@@ -212,20 +214,27 @@ impl OllamaBackend {
             }
             Err(e) => {
                 warn!("[assistant] failed to spawn ollama serve: {}", e);
-                return Err(AssistantError::OllamaServerDown);
+                return Err(AssistantError::OllamaServerStart(format!("cannot launch {}: {e}", bin_path.display())));
             }
         }
 
-        // Wait up to 8 s for the server to come up
-        for i in 0..16 {
-            tokio::time::sleep(Duration::from_millis(500)).await;
+        // Poll until the server answers, the child dies, or the timeout passes
+        // (a cold GPU start can take well over the old 8 s).
+        let deadline = tokio::time::Instant::now() + self.server_start_timeout;
+        while tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(250)).await;
             if self.server_alive().await {
-                info!("[assistant] ollama server started (attempt {})", i + 1);
+                info!("[assistant] ollama server started");
                 return Ok(());
             }
+            if let Some(Ok(Some(status))) = self.child.as_mut().map(|c| c.try_wait()) {
+                self.child = None;
+                warn!("[assistant] ollama serve exited early: {}", status);
+                return Err(AssistantError::OllamaServerStart(format!("the server exited ({status}); see {SERVER_LOG}")));
+            }
         }
-        warn!("[assistant] ollama serve did not start in time after 8s");
-        Err(AssistantError::OllamaServerDown)
+        warn!("[assistant] ollama serve did not start in {:?}", self.server_start_timeout);
+        Err(AssistantError::OllamaServerStart(format!("no answer after {}s; see {SERVER_LOG}", self.server_start_timeout.as_secs())))
     }
 
     /// Open `ollama-server.log` for appending, rotating it first when large.
@@ -370,7 +379,7 @@ impl OllamaBackend {
     async fn model_present(&self, model_id: &str) -> bool {
         let Ok(resp) = self
             .client
-            .get(format!("{}/api/tags", OLLAMA_BASE))
+            .get(format!("{}/api/tags", self.config.ollama_endpoint))
             .send()
             .await
         else {
@@ -403,7 +412,7 @@ impl OllamaBackend {
     pub async fn list_local_models(&self) -> Result<Vec<String>> {
         let resp = self
             .client
-            .get(format!("{}/api/tags", OLLAMA_BASE))
+            .get(format!("{}/api/tags", self.config.ollama_endpoint))
             .send()
             .await?;
         let body = resp.json::<serde_json::Value>().await?;
@@ -423,7 +432,7 @@ impl OllamaBackend {
     pub async fn delete_model(&self, model_id: &str) -> Result<()> {
         let resp = self
             .client
-            .delete(format!("{}/api/delete", OLLAMA_BASE))
+            .delete(format!("{}/api/delete", self.config.ollama_endpoint))
             .json(&serde_json::json!({ "name": model_id }))
             .send()
             .await?;
@@ -610,7 +619,7 @@ impl AssistantBackend for OllamaBackend {
 
         let resp = self
             .client
-            .post(format!("{}/api/pull", OLLAMA_BASE))
+            .post(format!("{}/api/pull", self.config.ollama_endpoint))
             .json(&serde_json::json!({ "name": model_id, "stream": true }))
             .timeout(Duration::from_secs(3600))
             .send()
@@ -664,7 +673,7 @@ impl AssistantBackend for OllamaBackend {
                 on_status(AssistantState::Downloading { downloaded: 0, total: None });
                 let resp = self
                     .client
-                    .post(format!("{}/api/pull", OLLAMA_BASE))
+                    .post(format!("{}/api/pull", self.config.ollama_endpoint))
                     .json(&serde_json::json!({ "name": embed_id, "stream": true }))
                     .timeout(Duration::from_secs(3600))
                     .send()
@@ -716,7 +725,7 @@ impl AssistantBackend for OllamaBackend {
 
         let resp = self
             .client
-            .post(format!("{}/api/chat", OLLAMA_BASE))
+            .post(format!("{}/api/chat", self.config.ollama_endpoint))
             .json(&payload)
             .timeout(Duration::from_secs(300))
             .send()
@@ -769,7 +778,7 @@ impl AssistantBackend for OllamaBackend {
         });
         let resp = self
             .client
-            .post(format!("{}/api/embeddings", OLLAMA_BASE))
+            .post(format!("{}/api/embeddings", self.config.ollama_endpoint))
             .json(&payload)
             .send()
             .await

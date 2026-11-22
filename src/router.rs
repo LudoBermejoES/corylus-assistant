@@ -25,7 +25,7 @@ pub async fn is_llm_ready(engine: &AssistantEngine) -> bool {
         .unwrap_or_default();
 
     let Ok(resp) = client
-        .get("http://127.0.0.1:11434/api/tags")
+        .get(format!("{}/api/tags", engine.config().ollama_endpoint))
         .send()
         .await
     else {
@@ -208,8 +208,16 @@ impl Router {
             *fsm_state = None;
         }
 
-        // Check LLM availability.
-        let llm_ready = is_llm_ready(engine).await;
+        // An installed assistant gets its server started here; if that fails the
+        // answer still comes from the basic engine but is tagged so the UI can say why.
+        let mut start_failed = false;
+        if engine.is_installed() {
+            if let Err(e) = engine.ensure_server().await {
+                tracing::warn!("[router] assistant server could not start: {}", e);
+                start_failed = true;
+            }
+        }
+        let llm_ready = !start_failed && is_llm_ready(engine).await;
 
         if llm_ready {
             // LLM path: try tool-calling first (additive, design D4).
@@ -238,10 +246,20 @@ impl Router {
                 Ok(text) => RouterResponse { text, source: "llm".to_string(), action: action_floor },
                 Err(e) => {
                     tracing::warn!("[router] LLM error, falling back: {}", e);
-                    self.fallback.query(message, lang).into()
+                    let mut resp: RouterResponse = self.fallback.query(message, lang).into();
+                    resp.source = "llm_unavailable".to_string();
+                    resp
                 }
             }
         } else {
+            let mut resp = self.fallback_turn(message, lang, fsm_state);
+            if start_failed { resp.source = "llm_unavailable".to_string(); }
+            resp
+        }
+    }
+
+    fn fallback_turn(&self, message: &str, lang: &str, fsm_state: &mut Option<FsmState>) -> RouterResponse {
+        {
             // Fallback path: check for action intent first (beats FSM detect_flow
             // so "compile to PDF" returns an action, not an FSM greeting).
             if let Some(action_resp) = self.fallback.detect_action(message, lang) {

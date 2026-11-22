@@ -20,5 +20,5 @@ hex = "0.4"
 zip = { version = "2", default-features = false, features = ["deflate"] }
 
 [dev-dependencies]
-tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util"] }
 tempfile = "3"
