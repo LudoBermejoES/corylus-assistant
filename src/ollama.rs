@@ -750,7 +750,8 @@ fn prepend_path_env(cmd: &mut tokio::process::Command, dir: &Path) {
     cmd.env("PATH", format!("{}{sep}{current}", dir.display()));
 }
 
-fn detect_system_ram() -> Option<u64> {
+/// Total physical RAM in bytes, or `None` where it cannot be read.
+pub fn detect_system_ram() -> Option<u64> {
     #[cfg(target_os = "linux")]
     {
         let data = std::fs::read_to_string("/proc/meminfo").ok()?;
@@ -772,7 +773,37 @@ fn detect_system_ram() -> Option<u64> {
     }
     #[cfg(target_os = "windows")]
     {
-        None
+        // GlobalMemoryStatusEx from kernel32, declared here to avoid a windows-sys dependency.
+        #[repr(C)]
+        struct MemoryStatusEx {
+            length: u32,
+            memory_load: u32,
+            total_phys: u64,
+            avail_phys: u64,
+            total_page_file: u64,
+            avail_page_file: u64,
+            total_virtual: u64,
+            avail_virtual: u64,
+            avail_extended_virtual: u64,
+        }
+        #[link(name = "kernel32")]
+        extern "system" {
+            fn GlobalMemoryStatusEx(buffer: *mut MemoryStatusEx) -> i32;
+        }
+        let mut status = MemoryStatusEx {
+            length: std::mem::size_of::<MemoryStatusEx>() as u32,
+            memory_load: 0,
+            total_phys: 0,
+            avail_phys: 0,
+            total_page_file: 0,
+            avail_page_file: 0,
+            total_virtual: 0,
+            avail_virtual: 0,
+            avail_extended_virtual: 0,
+        };
+        // SAFETY: `status` is a correctly sized MEMORYSTATUSEX with dwLength set.
+        let ok = unsafe { GlobalMemoryStatusEx(&mut status) } != 0;
+        (ok && status.total_phys > 0).then_some(status.total_phys)
     }
     #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
     {

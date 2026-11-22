@@ -55,6 +55,25 @@ mod unit_tests {
     }
 
     #[test]
+    fn ram_tier_boundaries_and_unknown() {
+        const GB: u64 = 1024 * 1024 * 1024;
+        assert_eq!(RamTier::from_bytes(None), RamTier::Low);
+        assert_eq!(RamTier::from_bytes(Some(8 * GB)), RamTier::Low);
+        assert_eq!(RamTier::from_bytes(Some(8 * GB + 1)), RamTier::Medium);
+        assert_eq!(RamTier::from_bytes(Some(20 * GB)), RamTier::Medium);
+        assert_eq!(RamTier::from_bytes(Some(56 * GB)), RamTier::High);
+    }
+
+    /// Detection must work on every desktop OS: a 0/None here made a 56 GB
+    /// Windows machine report "RAM tier: low".
+    #[cfg(any(target_os = "windows", target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn system_ram_is_detected_on_desktop() {
+        let ram = crate::detect_system_ram().expect("RAM not detected");
+        assert!(ram > 512 * 1024 * 1024, "implausible RAM: {ram}");
+    }
+
+    #[test]
     fn uninstall_removes_version_sentinel() {
         let tmp = tempfile::tempdir().unwrap();
         let cfg = test_config(tmp.path());

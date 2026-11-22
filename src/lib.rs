@@ -25,7 +25,7 @@ mod tests;
 pub use error::AssistantError;
 pub use state::AssistantState;
 pub use backend::{AssistantBackend, ChatMessage, ChatToken, RamTier, RetrievedChunk, build_system_prompt};
-pub use ollama::OllamaBackend;
+pub use ollama::{OllamaBackend, detect_system_ram};
 pub use index::{VectorIndex, RetrievedRow};
 pub use catalog::{ModelEntry, CATALOG};
 pub use fallback::{FallbackEngine, FsmState, FsmFlow};
