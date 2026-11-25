@@ -103,6 +103,38 @@ fn resolve_tool(name: &str, extra: &[ToolSpec]) -> Option<(bool, String)> {
     }
 }
 
+/// Repair a call whose name is not a tool but a value of a tool's enum argument.
+///
+/// Small models work out the right `run_command` id and then emit the id as the
+/// tool NAME (`editor.blockquote`, `run_command.editor.blockquote`), or call
+/// `run_command` with the id under another key. Only values the caller listed in
+/// the tool's own `enum` are accepted, so an invented id still resolves to nothing.
+/// Returns the call unchanged when nothing needs repairing.
+pub fn repair_call(name: &str, args: serde_json::Value, extra: &[ToolSpec]) -> (String, serde_json::Value) {
+    let name_trim = name.trim().trim_end_matches("()");
+    let name_trim = name_trim.strip_prefix("functions.").unwrap_or(name_trim);
+    for t in extra {
+        // Only the single-enum-argument shape is repaired; anything else is ambiguous.
+        let enums: Vec<(&String, &Vec<serde_json::Value>)> = t.params["properties"].as_object()
+            .map(|p| p.iter().filter_map(|(k, v)| v["enum"].as_array().map(|e| (k, e))).collect())
+            .unwrap_or_default();
+        let [(key, allowed)] = enums.as_slice() else { continue };
+        let listed = |v: &str| allowed.iter().any(|x| x == v);
+        let id = if name_trim == t.name {
+            // Right tool, wrong argument: take the first string argument that is a listed value.
+            if args.get(key.as_str()).and_then(|v| v.as_str()).is_some_and(listed) { continue }
+            args.as_object().and_then(|o| o.values().filter_map(|v| v.as_str()).find(|v| listed(v)))
+        } else {
+            let rest = name_trim.strip_prefix(t.name.as_str()).and_then(|r| r.strip_prefix(['.', ':', '/']));
+            Some(rest.unwrap_or(name_trim)).filter(|v| listed(v))
+        };
+        if let Some(id) = id {
+            return (t.name.clone(), serde_json::json!({ key.as_str(): id }));
+        }
+    }
+    (name.to_string(), args)
+}
+
 /// Try to get a tool-call response from Ollama for the given message.
 ///
 /// Sends a **non-streaming** request with the action catalog as tools.
@@ -160,6 +192,8 @@ async fn try_tool_call(message: &str, engine: &AssistantEngine, extra: &[ToolSpe
         .and_then(|f| f.get("arguments"))
         .cloned()
         .unwrap_or(serde_json::json!({}));
+
+    let (name, args) = repair_call(&name, args, extra);
 
     // The name must come from one of the two sources we offered. A model that
     // invents one gets no action at all: fabricating a write flag for an unknown
@@ -378,6 +412,38 @@ mod tool_payload_tests {
     fn an_unoffered_tool_name_resolves_to_none() {
         assert!(resolve_tool("replace_text", &[spec()]).is_none());
         assert!(resolve_tool("", &[]).is_none());
+    }
+
+    #[test]
+    fn a_command_id_used_as_the_tool_name_becomes_run_command() {
+        let (n, a) = repair_call("app.openSettings", serde_json::json!({}), &[spec()]);
+        assert_eq!((n.as_str(), a), ("run_command", serde_json::json!({ "command": "app.openSettings" })));
+    }
+
+    #[test]
+    fn close_variants_are_repaired() {
+        let want = serde_json::json!({ "command": "app.openSettings" });
+        for name in ["run_command.app.openSettings", "run_command:app.openSettings",
+                     "run_command/app.openSettings", "functions.app.openSettings", "app.openSettings()"] {
+            assert_eq!(repair_call(name, serde_json::json!({}), &[spec()]), ("run_command".to_string(), want.clone()), "{name}");
+        }
+        // Right tool, id under another key.
+        let (n, a) = repair_call("run_command", serde_json::json!({ "id": "app.openSettings" }), &[spec()]);
+        assert_eq!((n.as_str(), a), ("run_command", want));
+        // Right tool, right argument: untouched.
+        let ok = serde_json::json!({ "command": "app.openSettings" });
+        assert_eq!(repair_call("run_command", ok.clone(), &[spec()]).1, ok);
+    }
+
+    #[test]
+    fn an_id_outside_the_enum_is_not_repaired() {
+        for name in ["app.formatDisk", "run_command.app.formatDisk", "replace_text", ""] {
+            let (n, _) = repair_call(name, serde_json::json!({}), &[spec()]);
+            assert!(resolve_tool(&n, &[spec()]).is_none(), "{name}");
+        }
+        // Right tool, bad id: left alone; the backend's classify() refuses it.
+        let (n, a) = repair_call("run_command", serde_json::json!({ "command": "app.formatDisk" }), &[spec()]);
+        assert_eq!((n.as_str(), a["command"].as_str()), ("run_command", Some("app.formatDisk")));
     }
 
     #[test]
