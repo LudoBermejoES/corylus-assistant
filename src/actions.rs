@@ -27,6 +27,24 @@ pub struct ProposedAction {
 
 // ── Static catalog ───────────────────────────────────────────────────────────
 
+/// A tool the *caller* supplies at chat time, alongside the static catalog.
+///
+/// The crate deliberately knows nothing about what these do. Corylus's command
+/// registry lives in the app layer and cannot be reached from here without a
+/// dependency edge that would point the wrong way, so the app builds the spec
+/// and hands it in. Growing the tool list then never touches this crate again.
+#[derive(Debug, Clone)]
+pub struct ToolSpec {
+    pub name: String,
+    pub description: String,
+    /// JSON Schema for the tool's `parameters` object.
+    pub params: serde_json::Value,
+    /// Advisory only. The executor re-decides from its own registry (design D3),
+    /// and for an argument-dependent tool the name alone cannot answer it.
+    pub write: bool,
+    pub summary: String,
+}
+
 /// One entry in the crate-level action catalog.
 /// The app layer mirrors this with its own executor registry; the crate's copy
 /// is for FSM matching and LLM tool-schema generation only.
@@ -36,6 +54,10 @@ pub struct ActionEntry {
     pub description: &'static str,
     pub description_es: &'static str,
     pub write: bool,
+    /// JSON Schema for this action's `parameters` object, as a literal.
+    /// Lives here so the tool payload is built from the catalog rather than
+    /// from a per-name branch in the router.
+    pub params: &'static str,
     /// Simple keyword signals that indicate this action (all lowercase).
     pub intent_signals: &'static [&'static str],
     /// Summary template (English).
@@ -51,6 +73,7 @@ pub static ACTION_CATALOG: &[ActionEntry] = &[
         description: "Count the total words and documents in the open project",
         description_es: "Contar el total de palabras y documentos del proyecto abierto",
         write: false,
+        params: r#"{"type":"object","properties":{},"required":[]}"#,
         // Specific signals that unambiguously mean word-count, not compile.
         // Avoid single-word "word" to prevent false positives.
         intent_signals: &[
@@ -66,6 +89,7 @@ pub static ACTION_CATALOG: &[ActionEntry] = &[
         description: "Save a manual snapshot of the current document",
         description_es: "Guardar una instantánea manual del documento actual",
         write: true,
+        params: r#"{"type":"object","properties":{},"required":[]}"#,
         intent_signals: &[
             "snapshot", "instantánea", "guardar versión", "save version",
             "create snapshot", "take snapshot", "make snapshot",
@@ -79,6 +103,7 @@ pub static ACTION_CATALOG: &[ActionEntry] = &[
         description: "Open the compile/export panel, optionally pre-filled with a format",
         description_es: "Abrir el panel de compilación/exportación, opcionalmente pre-rellenado con un formato",
         write: false, // navigation only — does not export headlessly
+        params: r#"{"type":"object","properties":{"format":{"type":"string","description":"Output format: PDF, EPUB, or DOCX","enum":["PDF","EPUB","DOCX"]}},"required":[]}"#,
         intent_signals: &[
             "compil", "export", "generate pdf", "generate epub", "create pdf",
             "exportar", "compilar", "compile to", "export to", "open compile",
@@ -92,6 +117,7 @@ pub static ACTION_CATALOG: &[ActionEntry] = &[
         description: "Open the project statistics panel",
         description_es: "Abrir el panel de estadísticas del proyecto",
         write: false,
+        params: r#"{"type":"object","properties":{},"required":[]}"#,
         intent_signals: &[
             "statistics", "stats", "estadísticas", "open stats",
             "show statistics", "reading time", "tiempo de lectura",
@@ -105,6 +131,7 @@ pub static ACTION_CATALOG: &[ActionEntry] = &[
         description: "Resume the current ambient-sounds mix",
         description_es: "Reanudar la mezcla de sonidos ambientales actual",
         write: true,
+        params: r#"{"type":"object","properties":{},"required":[]}"#,
         // Require a qualifier alongside "play"/"reproduce" so this doesn't steal
         // turns from unrelated "play"-adjacent chat.
         intent_signals: &[
@@ -121,6 +148,7 @@ pub static ACTION_CATALOG: &[ActionEntry] = &[
         description: "Pause the current ambient-sounds mix",
         description_es: "Pausar la mezcla de sonidos ambientales actual",
         write: true,
+        params: r#"{"type":"object","properties":{},"required":[]}"#,
         intent_signals: &[
             "stop sounds", "stop ambient", "stop the ambient sounds", "stop my sounds",
             "pause sounds", "pause ambient sounds", "stop the rain", "pause my mix",
@@ -135,6 +163,7 @@ pub static ACTION_CATALOG: &[ActionEntry] = &[
         description: "Open the ambient-sounds mixer dialog",
         description_es: "Abrir el mezclador de sonidos ambientales",
         write: false,
+        params: r#"{"type":"object","properties":{},"required":[]}"#,
         intent_signals: &[
             "open the mixer", "open sound mixer", "open ambient sounds", "sound mixer",
             "abrir mezclador", "abrir sonidos ambientales", "abrir el mezclador de sonido",
@@ -147,6 +176,7 @@ pub static ACTION_CATALOG: &[ActionEntry] = &[
         description: "Enter or exit distraction-free writing mode",
         description_es: "Entrar o salir del modo de escritura sin distracciones",
         write: true,
+        params: r#"{"type":"object","properties":{},"required":[]}"#,
         intent_signals: &[
             "distraction free", "distraction-free", "focus mode", "go distraction free",
             "enter distraction free", "exit distraction free", "modo sin distracciones",
@@ -160,6 +190,7 @@ pub static ACTION_CATALOG: &[ActionEntry] = &[
         description: "Open the Settings screen, optionally at a named category",
         description_es: "Abrir la pantalla de Ajustes, opcionalmente en una categoría concreta",
         write: false,
+        params: r#"{"type":"object","properties":{"category":{"type":"string","description":"Settings category to open directly, e.g. appearance or ambientSounds"}},"required":[]}"#,
         intent_signals: &[
             "open settings", "show settings", "open preferences", "abrir ajustes",
             "abrir configuración", "abrir preferencias", "mostrar ajustes",

@@ -8,7 +8,7 @@
 
 use std::time::Duration;
 
-use crate::actions::{ProposedAction, ACTION_CATALOG};
+use crate::actions::{ProposedAction, ToolSpec, ACTION_CATALOG};
 use crate::fallback::{detect_lang, FallbackEngine, FallbackResponse, FsmState};
 use crate::AssistantEngine;
 
@@ -68,6 +68,41 @@ impl From<FallbackResponse> for RouterResponse {
     }
 }
 
+/// The tool payload offered to the model: the static catalog plus the caller's.
+/// Split out of `try_tool_call` so it can be tested without a running server.
+fn build_tools(extra: &[ToolSpec]) -> Vec<serde_json::Value> {
+    // Tool schemas come from the catalog's own `params` and from the caller's
+    // specs. There is no per-name branch here: a tool that needs arguments
+    // carries its schema with it, so adding one never edits this function.
+    let mut tools: Vec<serde_json::Value> = ACTION_CATALOG.iter().map(|e| {
+        serde_json::json!({
+            "type": "function",
+            "function": {
+                "name": e.name,
+                "description": e.description,
+                "parameters": serde_json::from_str::<serde_json::Value>(e.params)
+                    .unwrap_or_else(|_| serde_json::json!({ "type": "object", "properties": {}, "required": [] })),
+            }
+        })
+    }).collect();
+    tools.extend(extra.iter().map(|t| {
+        serde_json::json!({
+            "type": "function",
+            "function": { "name": t.name, "description": t.description, "parameters": t.params }
+        })
+    }));
+    tools
+}
+
+/// The write flag and summary for a tool name the model returned, or `None` if
+/// the name was never offered.
+fn resolve_tool(name: &str, extra: &[ToolSpec]) -> Option<(bool, String)> {
+    match crate::actions::find_action(name) {
+        Some(e) => Some((e.write, e.summary.to_string())),
+        None => extra.iter().find(|t| t.name == name).map(|t| (t.write, t.summary.clone())),
+    }
+}
+
 /// Try to get a tool-call response from Ollama for the given message.
 ///
 /// Sends a **non-streaming** request with the action catalog as tools.
@@ -76,42 +111,11 @@ impl From<FallbackResponse> for RouterResponse {
 ///
 /// Design D4: this is strictly additive. Callers fall back to the FSM floor
 /// when this returns `None`.
-async fn try_tool_call(message: &str, engine: &AssistantEngine) -> Option<ProposedAction> {
+async fn try_tool_call(message: &str, engine: &AssistantEngine, extra: &[ToolSpec]) -> Option<ProposedAction> {
     let model_id = engine.config().model_id;
     let ollama_base = engine.config().ollama_endpoint;
 
-    // Build tool schemas from the action catalog.
-    let tools: Vec<serde_json::Value> = ACTION_CATALOG.iter().map(|e| {
-        serde_json::json!({
-            "type": "function",
-            "function": {
-                "name": e.name,
-                "description": e.description,
-                "parameters": {
-                    "type": "object",
-                    "properties": if e.name == "open_compile_panel" {
-                        serde_json::json!({
-                            "format": {
-                                "type": "string",
-                                "description": "Output format: PDF, EPUB, or DOCX",
-                                "enum": ["PDF", "EPUB", "DOCX"]
-                            }
-                        })
-                    } else if e.name == "open_settings" {
-                        serde_json::json!({
-                            "category": {
-                                "type": "string",
-                                "description": "Settings category to open directly, e.g. appearance or ambientSounds"
-                            }
-                        })
-                    } else {
-                        serde_json::json!({})
-                    },
-                    "required": serde_json::json!([])
-                }
-            }
-        })
-    }).collect();
+    let tools = build_tools(extra);
 
     let payload = serde_json::json!({
         "model": model_id,
@@ -157,11 +161,12 @@ async fn try_tool_call(message: &str, engine: &AssistantEngine) -> Option<Propos
         .cloned()
         .unwrap_or(serde_json::json!({}));
 
-    // Look up write flag from the catalog.
-    let entry = crate::actions::find_action(&name)?;
-    let summary = entry.summary.to_string();
+    // The name must come from one of the two sources we offered. A model that
+    // invents one gets no action at all: fabricating a write flag for an unknown
+    // tool is exactly the guess this path must not make.
+    let (write, summary) = resolve_tool(&name, extra)?;
 
-    Some(ProposedAction { name, args, write: entry.write, summary })
+    Some(ProposedAction { name, args, write, summary })
 }
 
 /// The assistant router. Owns the `FallbackEngine`; borrows the `AssistantEngine`
@@ -186,6 +191,8 @@ impl Router {
     /// - `message`: raw user input.
     /// - `fsm_state`: per-surface FSM session state (mutated in place).
     /// - `engine`: the `AssistantEngine` used for LLM calls.
+    /// - `extra_tools`: caller-supplied tools offered alongside the static
+    ///   catalog. Empty is valid and reproduces the previous behaviour.
     ///
     /// Returns the response text plus the source tag (`"llm"` | `"fallback"`).
     pub async fn chat(
@@ -193,6 +200,7 @@ impl Router {
         message: &str,
         fsm_state: &mut Option<FsmState>,
         engine: &AssistantEngine,
+        extra_tools: &[ToolSpec],
     ) -> RouterResponse {
         let lang = detect_lang(message);
 
@@ -222,7 +230,7 @@ impl Router {
         if llm_ready {
             // LLM path: try tool-calling first (additive, design D4).
             // If the model selects a tool, return immediately with the action.
-            if let Some(tool_action) = try_tool_call(message, engine).await {
+            if let Some(tool_action) = try_tool_call(message, engine, extra_tools).await {
                 tracing::info!("[router] tool-call resolved to action: {}", tool_action.name);
                 let summary = tool_action.summary.clone();
                 return RouterResponse {
@@ -302,5 +310,79 @@ mod tests {
     #[test]
     fn router_new_does_not_panic() {
         let _ = Router::new();
+    }
+}
+
+#[cfg(test)]
+mod tool_payload_tests {
+    use super::*;
+    use crate::actions::ACTION_CATALOG;
+
+    fn spec() -> ToolSpec {
+        ToolSpec {
+            name: "run_command".into(),
+            description: "Run a Corylus command".into(),
+            params: serde_json::json!({
+                "type": "object",
+                "properties": { "command": { "type": "string", "enum": ["app.openSettings"] } },
+                "required": ["command"]
+            }),
+            write: false,
+            summary: "Run a command".into(),
+        }
+    }
+
+    fn names(tools: &[serde_json::Value]) -> Vec<String> {
+        tools.iter().map(|t| t["function"]["name"].as_str().unwrap().to_string()).collect()
+    }
+
+    /// 1.2 — every catalog entry carries a parseable schema, so the payload is
+    /// built from the catalog rather than from a per-name branch.
+    #[test]
+    fn every_catalog_entry_has_a_parseable_params_schema() {
+        for e in ACTION_CATALOG {
+            let v: serde_json::Value = serde_json::from_str(e.params)
+                .unwrap_or_else(|err| panic!("{}: params is not JSON: {err}", e.name));
+            assert_eq!(v["type"], "object", "{}: params must be an object schema", e.name);
+        }
+    }
+
+    #[test]
+    fn compile_panel_still_offers_its_three_formats() {
+        let tools = build_tools(&[]);
+        let compile = tools.iter().find(|t| t["function"]["name"] == "open_compile_panel").unwrap();
+        let formats = &compile["function"]["parameters"]["properties"]["format"]["enum"];
+        assert_eq!(formats, &serde_json::json!(["PDF", "EPUB", "DOCX"]));
+    }
+
+    /// 1.3 — the injected tool is offered alongside the catalog, not instead of it.
+    #[test]
+    fn injected_tools_are_offered_with_the_catalog() {
+        let tools = build_tools(&[spec()]);
+        let n = names(&tools);
+        assert_eq!(tools.len(), ACTION_CATALOG.len() + 1);
+        assert!(n.contains(&"word_count".to_string()));
+        assert!(n.contains(&"run_command".to_string()));
+        let injected = tools.iter().find(|t| t["function"]["name"] == "run_command").unwrap();
+        assert_eq!(injected["function"]["parameters"]["properties"]["command"]["enum"][0], "app.openSettings");
+    }
+
+    #[test]
+    fn no_extra_tools_reproduces_the_catalog_alone() {
+        assert_eq!(build_tools(&[]).len(), ACTION_CATALOG.len());
+    }
+
+    /// 1.4 — a name we never offered resolves to nothing, rather than to a
+    /// ProposedAction carrying an invented write flag.
+    #[test]
+    fn an_unoffered_tool_name_resolves_to_none() {
+        assert!(resolve_tool("replace_text", &[spec()]).is_none());
+        assert!(resolve_tool("", &[]).is_none());
+    }
+
+    #[test]
+    fn resolve_tool_finds_both_sources() {
+        assert_eq!(resolve_tool("create_snapshot", &[]).unwrap().0, true);
+        assert_eq!(resolve_tool("run_command", &[spec()]).unwrap().0, false);
     }
 }

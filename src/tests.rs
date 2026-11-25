@@ -217,7 +217,7 @@ mod server_tests {
     async fn chat_tags_basic_mode_when_server_cannot_start() {
         let tmp = tempfile::tempdir().unwrap();
         let e = installed_engine(tmp.path(), &dead_endpoint().await);
-        let r = Router::new().chat("hello", &mut None, &e).await;
+        let r = Router::new().chat("hello", &mut None, &e, &[]).await;
         assert_eq!(r.source, "llm_unavailable");
     }
 
@@ -226,7 +226,7 @@ mod server_tests {
         let tmp = tempfile::tempdir().unwrap();
         let cfg = EngineConfig::default_for_ram(tmp.path().to_path_buf(), None);
         let e = AssistantEngine::new(cfg);
-        let r = Router::new().chat("hello", &mut None, &e).await;
+        let r = Router::new().chat("hello", &mut None, &e, &[]).await;
         assert_eq!(r.source, "fallback");
     }
 }
