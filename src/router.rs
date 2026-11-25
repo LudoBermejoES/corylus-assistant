@@ -135,6 +135,22 @@ pub fn repair_call(name: &str, args: serde_json::Value, extra: &[ToolSpec]) -> (
     (name.to_string(), args)
 }
 
+/// Steers the model away from tools on questions. Measured on qwen3:1.7b with the
+/// full tool list: without it, how-to questions got a tool call about 1 in 3.
+const TOOL_SYSTEM_PROMPT: &str = "You are the writing assistant inside Corylus. Call a function only when the writer \
+asks you to DO something in the app (\"open...\", \"turn on...\", \"make this bold\") or to read or search their \
+project. A question about how to do something, what something is, or why (\"how do I...\", \"what is...\", \
+\"¿cómo...?\") gets a short written answer and no function call.";
+
+/// A "how do I / ¿cómo ...?" question asks for an explanation, never for the action itself.
+/// shortcut: leading phrases only, EN and ES; widen when another language ships.
+fn is_how_to_question(message: &str) -> bool {
+    let m = message.trim().trim_start_matches(['¿', '"', '\'']).to_lowercase();
+    ["how do i", "how can i", "how to", "how should i", "why ", "cómo", "como ", "por qué", "por que "]
+        .iter()
+        .any(|p| m.starts_with(p))
+}
+
 /// Try to get a tool-call response from Ollama for the given message.
 ///
 /// Sends a **non-streaming** request with the action catalog as tools.
@@ -144,6 +160,9 @@ pub fn repair_call(name: &str, args: serde_json::Value, extra: &[ToolSpec]) -> (
 /// Design D4: this is strictly additive. Callers fall back to the FSM floor
 /// when this returns `None`.
 async fn try_tool_call(message: &str, engine: &AssistantEngine, extra: &[ToolSpec]) -> Option<ProposedAction> {
+    if is_how_to_question(message) {
+        return None;
+    }
     let model_id = engine.config().model_id;
     let ollama_base = engine.config().ollama_endpoint;
 
@@ -151,7 +170,10 @@ async fn try_tool_call(message: &str, engine: &AssistantEngine, extra: &[ToolSpe
 
     let payload = serde_json::json!({
         "model": model_id,
-        "messages": [{ "role": "user", "content": message }],
+        "messages": [
+            { "role": "system", "content": TOOL_SYSTEM_PROMPT },
+            { "role": "user", "content": message },
+        ],
         "tools": tools,
         "stream": false,
     });
@@ -444,6 +466,18 @@ mod tool_payload_tests {
         // Right tool, bad id: left alone; the backend's classify() refuses it.
         let (n, a) = repair_call("run_command", serde_json::json!({ "command": "app.formatDisk" }), &[spec()]);
         assert_eq!((n.as_str(), a["command"].as_str()), ("run_command", Some("app.formatDisk")));
+    }
+
+    #[test]
+    fn how_to_questions_get_no_tool_but_requests_and_reads_do() {
+        for q in ["how do I change the font size?", "¿Cómo compilo mi proyecto en PDF?", "Why is it slow?",
+                  "  ¿Por qué no guarda?", "how to split the editor"] {
+            assert!(is_how_to_question(q), "{q}");
+        }
+        for q in ["How many words have I written?", "What is in the binder?", "¿Cuántas palabras llevo?",
+                  "What does chapter one say?", "Open the compile panel", "Split the editor"] {
+            assert!(!is_how_to_question(q), "{q}");
+        }
     }
 
     #[test]
