@@ -713,15 +713,7 @@ impl AssistantBackend for OllamaBackend {
         self.ensure_server_running().await?;
         info!("[assistant] chat: sending {} messages to model {}", messages.len(), self.config.model_id);
 
-        let payload = serde_json::json!({
-            "model": self.config.model_id,
-            "messages": messages,
-            "stream": true,
-            "options": {
-                "num_ctx": self.config.context_window,
-                "keep_alive": "10m",
-            }
-        });
+        let payload = chat_payload(&self.config.model_id, &messages, self.config.context_window);
 
         let resp = self
             .client
@@ -816,6 +808,17 @@ impl crate::rag::AsyncEmbedFn for OllamaBackend {
 // ── Helpers ────────────────────────────────────────────────────────────────────
 
 /// Returns `(asset_filename, expected_sha256)` for the current platform/arch.
+/// `keep_alive` is a top-level field of `/api/chat`; inside `options` Ollama ignores it.
+fn chat_payload(model: &str, messages: &[ChatMessage], num_ctx: impl serde::Serialize) -> serde_json::Value {
+    serde_json::json!({
+        "model": model,
+        "messages": messages,
+        "stream": true,
+        "keep_alive": "10m",
+        "options": { "num_ctx": num_ctx }
+    })
+}
+
 fn platform_asset() -> Result<(String, &'static str)> {
     #[cfg(target_os = "macos")]
     {
@@ -954,5 +957,18 @@ pub fn detect_system_ram() -> Option<u64> {
     #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
     {
         None
+    }
+}
+
+#[cfg(test)]
+mod chat_payload_tests {
+    use super::*;
+
+    #[test]
+    fn keep_alive_is_top_level_not_in_options() {
+        let p = chat_payload("m", &[], 4096);
+        assert_eq!(p["keep_alive"], "10m");
+        assert!(p["options"].get("keep_alive").is_none());
+        assert_eq!(p["options"]["num_ctx"], 4096);
     }
 }
