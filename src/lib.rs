@@ -25,6 +25,10 @@ mod tests;
 
 pub use error::AssistantError;
 pub use state::AssistantState;
+/// Turns of history a chat request carries, and the most characters of each.
+pub const HISTORY_TURNS: usize = 4;
+pub const HISTORY_TURN_CHARS: usize = 1000;
+
 pub use backend::{AssistantBackend, ChatMessage, ChatToken, RamTier, RetrievedChunk, build_system_prompt};
 pub use ollama::{OllamaBackend, detect_system_ram};
 pub use index::{VectorIndex, RetrievedRow};
@@ -448,6 +452,13 @@ impl AssistantEngine {
     /// Send a chat message grounded in the RAG index and return the full response text.
     /// Retrieves the top-5 relevant chunks, builds a system prompt, and calls the backend.
     pub async fn chat(&self, user_message: &str) -> Result<String> {
+        self.chat_with(user_message, None, &[]).await
+    }
+
+    /// `chat` with a companion `persona` (voice only, inside the fixed rules) and the last turns
+    /// of the conversation. Only `user` and `assistant` turns are kept, the last
+    /// [`HISTORY_TURNS`] of them: the caller cannot smuggle in a `system` message.
+    pub async fn chat_with(&self, user_message: &str, persona: Option<&str>, history: &[ChatMessage]) -> Result<String> {
         tracing::info!("[assistant] chat() called with message: {:?}", &user_message[..user_message.len().min(80)]);
         // Retrieve relevant context — falls back to empty if server not yet up or index empty.
         // The actual server startup happens inside the backend chat() call below.
@@ -458,12 +469,15 @@ impl AssistantEngine {
             source: r.source,
             score: (1.0 - r.distance as f32).max(0.0),
         }).collect();
-        let system_prompt = backend::build_system_prompt(&chunks);
+        let system_prompt = backend::build_system_prompt(&chunks, persona, fallback::detect_lang(user_message));
 
-        let messages = vec![
-            ChatMessage { role: "system".into(), content: system_prompt },
-            ChatMessage { role: "user".into(),   content: user_message.into() },
-        ];
+        let turns: Vec<&ChatMessage> = history.iter().filter(|m| m.role == "user" || m.role == "assistant").collect();
+        let mut messages = vec![ChatMessage { role: "system".into(), content: system_prompt }];
+        messages.extend(turns[turns.len().saturating_sub(HISTORY_TURNS)..].iter().map(|m| ChatMessage {
+            role: m.role.clone(),
+            content: m.content.chars().take(HISTORY_TURN_CHARS).collect(),
+        }));
+        messages.push(ChatMessage { role: "user".into(), content: user_message.into() });
 
         let (_cancel_tx, cancel_rx) = tokio::sync::oneshot::channel::<()>();
         // Use an async channel so receiving tokens doesn't block the Tokio worker thread.

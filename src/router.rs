@@ -258,6 +258,20 @@ impl Router {
         engine: &AssistantEngine,
         extra_tools: &[ToolSpec],
     ) -> RouterResponse {
+        self.chat_with(message, fsm_state, engine, extra_tools, None, &[]).await
+    }
+
+    /// `chat` with the companion's `persona` and the last turns, both used only by the model's
+    /// written answer. The tools, `classify` and the fallback engine never see them.
+    pub async fn chat_with(
+        &self,
+        message: &str,
+        fsm_state: &mut Option<FsmState>,
+        engine: &AssistantEngine,
+        extra_tools: &[ToolSpec],
+        persona: Option<&str>,
+        history: &[crate::ChatMessage],
+    ) -> RouterResponse {
         let lang = detect_lang(message);
 
         // If an FSM flow is in progress, advance it regardless of LLM state.
@@ -306,7 +320,7 @@ impl Router {
             let action_floor = self.fallback.detect_action(message, lang)
                 .and_then(|r| r.action);
 
-            match engine.chat(message).await {
+            match engine.chat_with(message, persona, history).await {
                 Ok(text) => RouterResponse { text, source: "llm".to_string(), action: action_floor },
                 Err(e) => {
                     tracing::warn!("[router] LLM error, falling back: {}", e);
